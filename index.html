@@ -283,9 +283,9 @@
       <div class="v num"><span id="jit-value">-</span><span class="u">ms</span></div>
     </div>
     <div class="card statcard reveal" style="animation-delay:.18s">
-      <div class="label">Packet&nbsp;Loss
-        <span class="info"><button class="i-btn" aria-label="What is packet loss?" aria-expanded="false">i</button>
-          <span class="tip" role="tooltip"><b>Estimated.</b> A browser can't see true packet loss since it happens below HTTP, and TCP silently re-sends dropped packets before your code notices. Instead we send a burst of tiny requests and count how many don't reply within a short window. For a live call or game, a reply that arrives too late is as good as lost, so this is a practical "is my connection dropping or stalling?" proxy, not a true network-layer figure. The window is scaled to your own baseline latency so a slow link isn't unfairly penalised. Lower is better.</span></span>
+      <div class="label">Reliability
+        <span class="info"><button class="i-btn" aria-label="What does reliability mean?" aria-expanded="false">i</button>
+          <span class="tip" role="tooltip"><b>Estimated.</b> A browser can't measure true packet loss as it happens below HTTP, and TCP quietly re-sends dropped packets before your code ever sees them. So we send a burst of tiny requests and report the share that get a reply <i>in time</i>; for a live call or game, a reply that lands too late is as good as lost. Treat this as a practical "is my connection holding up?" score, not a network-layer figure. The window scales to your own baseline latency, so a slow link isn't unfairly penalised. Higher is better.</span></span>
       </div>
       <div class="v num"><span id="loss-value">-</span><span class="u">%</span></div>
     </div>
@@ -342,7 +342,7 @@
   </details>
 
   <footer>
-    Measures the network path between your browser and this server. The results reflect that path, not necessarily your ISP's maximum. Packet loss is an HTTP-timeout estimate, not true IP-layer loss.
+    Measures the network path between your browser and this server. The results reflect that path, not necessarily your ISP's maximum. Packet loss is reported as a Reliability score (an HTTP-timeout proxy), not a true IP-layer figure.
     <br>Built by Pedro · Inspired by Cloudflare Speed Test; not affiliated with Cloudflare. MIT licensed. · <a href="https://github.com/bunnis/blip-pedros-speed-test" target="_blank" rel="noopener noreferrer">Source on GitHub</a>
   </footer>
 </div>
@@ -359,6 +359,14 @@ const CONFIG = {
   parallelStreams: 6,                           // concurrent connections per transfer phase
   sampleIntervalMs: 200,                         // throughput sampling cadence (also chart cadence)
 
+  // Accuracy/methodology knobs (aligned with Cloudflare's @cloudflare/speedtest engine).
+  estimatedServerTime: 0,         // ms subtracted from latency TTFB when no Server-Timing header is present (≈0 for static nginx)
+  loadedLatencyThrottleMs: 400,   // gap between loaded-latency probes during a transfer
+  loadedLatencyMaxPoints: 20,     // keep only the most recent N loaded-latency samples
+  bandwidthFinishRequestDuration: 1000, // once one file at a size would take ≥ this, stop ramping to larger sizes and dwell
+  rampSliceMs: 1200,              // probe slice spent at each intermediate size while ramping up
+  minSampleFracOfInterval: 0.5,   // discard throughput samples from intervals shorter than this × sampleIntervalMs
+
   ping: {
     floorMs: 300,            // timeout floor; effective timeout = max(floorMs, baselineMult * baseline median)
     baselineMult: 3,
@@ -369,21 +377,23 @@ const CONFIG = {
 
   endpoints: { upload: "/upload", ip: "/ip", dlBase: "/dl/" },
 
-  // Files must exist as incompressible static files (see make-files.sh). weight = share of the download window.
+  // Files must exist as incompressible static files (see make-files.sh). List ascending:
+  // the adaptive ramp in phaseTransfer decides how far up to climb and where to dwell,
+  // so there's no per-size weight any more.
   download: [
-    { bytes: 102400,    file: "100kb.bin", label: "100 kB", weight: 1 },
-    { bytes: 1048576,   file: "1mb.bin",   label: "1 MB",   weight: 1 },
-    { bytes: 10485760,  file: "10mb.bin",  label: "10 MB",  weight: 2 },
-    { bytes: 26214400,  file: "25mb.bin",  label: "25 MB",  weight: 3 },
-    { bytes: 104857600, file: "100mb.bin", label: "100 MB", weight: 4 },
+    { bytes: 102400,    file: "100kb.bin", label: "100 kB" },
+    { bytes: 1048576,   file: "1mb.bin",   label: "1 MB"   },
+    { bytes: 10485760,  file: "10mb.bin",  label: "10 MB"  },
+    { bytes: 26214400,  file: "25mb.bin",  label: "25 MB"  },
+    { bytes: 104857600, file: "100mb.bin", label: "100 MB" },
   ],
-  // Upload payloads are generated client-side; weight = share of the upload window.
+  // Upload payloads are generated client-side. Same ascending-sizes / adaptive-ramp rule.
   upload: [
-    { bytes: 102400,    label: "100 kB", weight: 1 },
-    { bytes: 1048576,   label: "1 MB",   weight: 1 },
-    { bytes: 10485760,  label: "10 MB",  weight: 2 },
-    { bytes: 26214400,  label: "25 MB",  weight: 3 },
-    { bytes: 104857600, label: "100 MB", weight: 4 },
+    { bytes: 102400,    label: "100 kB" },
+    { bytes: 1048576,   label: "1 MB"   },
+    { bytes: 10485760,  label: "10 MB"  },
+    { bytes: 26214400,  label: "25 MB"  },
+    { bytes: 104857600, label: "100 MB" },
   ],
 };
 
@@ -418,6 +428,7 @@ function jitterOf(arr) {
 const fmtMbps = (v) => v == null ? "-" : (v >= 100 ? Math.round(v).toString() : v.toFixed(1));
 const fmtMs = (v) => v == null ? "-" : (v >= 100 ? Math.round(v).toString() : v.toFixed(1));
 const fmtLoss = (v) => v == null ? "-" : (v === 0 ? "0" : v.toFixed(1));
+const fmtReliability = (loss) => loss == null ? "-" : (loss <= 0 ? "100" : (100 - loss).toFixed(1));
 
 /* ============================ state ============================ */
 let state, stopFlag = false, running = false, progTimer = null;
@@ -445,6 +456,27 @@ function getIP() {
     .finally(() => clearTimeout(to));
 }
 
+// Prefer the Resource Timing API for latency: responseStart - requestStart is the
+// network round-trip to first byte, free of the XHR send-scheduling / event-loop
+// jitter that inflates a wall-clock delta (jitter most of all). Subtract any server
+// processing time reported via Server-Timing - ≈0 on static nginx, but the hook is
+// here if a dynamic backend is ever proxied in. Falls back to the wall-clock delta
+// when timing isn't available (e.g. cross-origin, or the entry didn't register).
+function rttFromTiming(url, fallbackMs) {
+  try {
+    const ents = performance.getEntriesByName(url);
+    const e = ents.length ? ents[ents.length - 1] : null;
+    if (e && e.responseStart > 0 && e.requestStart > 0) {
+      const server = (e.serverTiming && e.serverTiming.length)
+        ? e.serverTiming.reduce((a, s) => a + (s.duration || 0), 0)
+        : (CONFIG.estimatedServerTime || 0);
+      const v = (e.responseStart - e.requestStart) - server;
+      if (isFinite(v) && v >= 0) return v;
+    }
+  } catch (_) {}
+  return fallbackMs;
+}
+
 // Resolves with RTT (ms) on a completed reply; rejects {type:'timeout'|'error'}.
 function pingOnce(timeoutMs) {
   if (DEMO) {
@@ -456,9 +488,10 @@ function pingOnce(timeoutMs) {
   return new Promise((res, rej) => {
     const xhr = new XMLHttpRequest();
     const t = now();
-    xhr.open("GET", CONFIG.endpoints.upload + "?pl=" + rnd(), true); // GET on /upload -> 204, tiny, no body
+    const url = CONFIG.endpoints.upload + "?pl=" + rnd(); // GET on /upload -> 204, tiny, no body
+    xhr.open("GET", url, true);
     xhr.timeout = timeoutMs;
-    xhr.onload = () => res(now() - t);
+    xhr.onload = () => res(rttFromTiming(xhr.responseURL || url, now() - t));
     xhr.onerror = () => rej({ type: "error" });
     xhr.ontimeout = () => rej({ type: "timeout" });
     try { xhr.send(); } catch (_) { rej({ type: "error" }); }
@@ -561,16 +594,21 @@ async function measureSize(kind, size, deadline) {
     kind === "download" ? dlWorker(size.file, deadline, ctrl, counter) : upWorker(size.bytes, deadline, ctrl, counter));
 
   let last = now(), lastBytes = 0;
+  const minDt = (CONFIG.sampleIntervalMs * (CONFIG.minSampleFracOfInterval || 0)) / 1000;
   await new Promise((resolve) => {
     const id = setInterval(() => {
       const t = now(), dt = (t - last) / 1000;
+      const ended = now() >= deadline || stopFlag;
+      // [#8] drop degenerate short intervals (timer coalescing / backgrounded-tab catch-up):
+      // skipping leaves last/lastBytes untouched so the bytes fold into the next, full-length tick.
+      if (dt < minDt && !ended) return;
       let mbps;
       if (DEMO) { mbps = synthMbps(kind, size); counter.bytes += (mbps * 1e6 * dt) / 8; }
       else { mbps = dt > 0 ? ((counter.bytes - lastBytes) * 8) / dt / 1e6 : 0; }
       last = t; lastBytes = counter.bytes;
       samples.push(mbps);
       pushChart(kind, mbps);
-      if (now() >= deadline || stopFlag) { clearInterval(id); resolve(); }
+      if (ended) { clearInterval(id); resolve(); }
     }, CONFIG.sampleIntervalMs);
   });
 
@@ -584,25 +622,58 @@ async function phaseTransfer(kind, durationMs) {
   setPhase(kind, kind === "download" ? "Measuring download speed" : "Measuring upload speed");
   if (DEMO) state.demoLoad = kind === "download" ? 2.6 : 2.0;
 
-  const plan = (kind === "download" ? CONFIG.download : CONFIG.upload);
-  const wsum = plan.reduce((a, s) => a + s.weight, 0);
+  const plan = (kind === "download" ? CONFIG.download : CONFIG.upload); // ascending by size
   const phaseDeadline = now() + durationMs;
+  const bucket = (kind === "download" ? state.dlSamples : state.upSamples);
 
-  // concurrent loaded-latency probe (bufferbloat): only successful RTTs are recorded
+  // [#2] concurrent loaded-latency probe (bufferbloat): throttled and capped, successes only.
+  // Back-to-back probing during a saturated transfer self-contends and skews the figure.
   const loadedRtts = [];
   const loadedStop = { v: false };
   const loadedLoop = (async () => {
     while (!loadedStop.v && now() < phaseDeadline && !stopFlag) {
-      try { loadedRtts.push(await pingOnce(state.pingTimeout)); } catch (_) {}
+      try {
+        loadedRtts.push(await pingOnce(state.pingTimeout));
+        if (loadedRtts.length > CONFIG.loadedLatencyMaxPoints) loadedRtts.shift();
+      } catch (_) {}
+      await sleep(CONFIG.loadedLatencyThrottleMs);
     }
   })();
 
-  for (const size of plan) {
+  // [#4] escalate-or-dwell ramp. Walk up file sizes while the link clears them quickly;
+  // once a size's files would take >= bandwidthFinishRequestDuration (link saturated at
+  // this size) or the next size can't fit in the time left, stop climbing and spend the
+  // rest of the window at that largest feasible size. Keeps the full window busy without
+  // a slow tunnel grinding away on the 100 MB file, and the headline p90 ends up dominated
+  // by steady-state samples at the right size rather than slow-start on every size.
+  const record = (size, samples) => {
+    const d = state.detail[kind];
+    const existing = d.find((x) => x.label === size.label);
+    if (existing) existing.samples = existing.samples.concat(samples);
+    else d.push({ label: size.label, samples });
+    bucket.push(...samples);
+  };
+  const estPerFileMs = (size, fromSamples) => {
+    const mbps = fromSamples.length ? pct(fromSamples, 0.9) : 0;     // p90 discounts slow-start
+    const perStreamBps = (mbps * 1e6) / CONFIG.parallelStreams;
+    return perStreamBps > 0 ? (size.bytes * 8 / perStreamBps) * 1000 : Infinity;
+  };
+
+  for (let i = 0; i < plan.length; i++) {
     if (stopFlag || now() >= phaseDeadline) break;
-    const subDeadline = Math.min(phaseDeadline, now() + (durationMs * size.weight) / wsum);
-    const samples = await measureSize(kind, size, subDeadline);
-    state.detail[kind].push({ label: size.label, samples });
-    (kind === "download" ? state.dlSamples : state.upSamples).push(...samples);
+    const size = plan[i], isLast = i === plan.length - 1;
+    const sliceMs = isLast ? (phaseDeadline - now()) : Math.min(phaseDeadline - now(), CONFIG.rampSliceMs);
+    const samples = await measureSize(kind, size, now() + sliceMs);
+    record(size, samples);
+    if (isLast) break;
+
+    const next = plan[i + 1];
+    const stopClimbing = estPerFileMs(size, samples) >= CONFIG.bandwidthFinishRequestDuration
+      || estPerFileMs(next, samples) >= (phaseDeadline - now());
+    if (stopClimbing) {
+      if (phaseDeadline - now() > 0 && !stopFlag) record(size, await measureSize(kind, size, phaseDeadline));
+      break;
+    }
   }
 
   loadedStop.v = true; await loadedLoop;
@@ -617,6 +688,9 @@ async function runTest() {
   setRunning(true);
   hideBanner();
   resetReadouts();
+  // [#1] start each run with a clean, generously-sized resource-timing buffer so every
+  // ping has an entry to read and none are dropped on the default ~250-entry cap.
+  try { performance.clearResourceTimings(); performance.setResourceTimingBufferSize(20000); } catch (_) {}
 
   try {
     await getIP();
@@ -711,7 +785,7 @@ function refreshReadouts(final) {
     $("lat-value").textContent = fmtMs(pct(state.rttUnloaded, 0.5));
     $("jit-value").textContent = fmtMs(jitterOf(state.rttUnloaded));
   }
-  if (state.loss != null) $("loss-value").textContent = fmtLoss(state.loss);
+  if (state.loss != null) $("loss-value").textContent = fmtReliability(state.loss);
 
   // charts
   const dlRef = state.dlSamples.length ? pct(state.dlSamples, 0.9) : recent(state.dlChart);
@@ -880,7 +954,7 @@ function buildReport() {
     + (ds ? "  [min " + fmtMs(ds.min) + " / max " + fmtMs(ds.max) + "]" : ""));
   L.push("Jitter:       " + fmtMs(jitterOf(state.rttUnloaded)) + " ms");
   L.push("Latency under load:  down " + fmtMs(loadDl) + " ms / up " + fmtMs(loadUp) + " ms");
-  L.push("Packet loss:  " + fmtLoss(state.loss) + " %  (HTTP-timeout proxy, window "
+  L.push("Reliability:  " + fmtReliability(state.loss) + " %  (timely-reply rate; HTTP-timeout proxy, window "
     + Math.round(state.pingTimeout) + " ms, " + state.lossSent + " probes)"
     + (state.lossSent < CONFIG.ping.minSamplesForLoss ? "  [few samples - low confidence]" : ""));
   L.push("");

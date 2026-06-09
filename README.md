@@ -6,6 +6,23 @@ estimated packet-loss figure, and a simple quality score. No backend, no
 external libraries, no build step. Served by bare nginx.
 ---
 
+### Quick start with Docker
+
+Runs the official nginx image with this repo's config, page, and download files
+mounted in. No build step.
+
+```bash
+# 1. Generate the incompressible download files once (host side).
+./make-files.sh ./dl
+
+# 2. Run it: serves on http:///, restarts on boot, dl/ persists on the host.
+docker run -d --name blip --restart unless-stopped -p 80:80 \
+  -v "$PWD/nginx.conf:/etc/nginx/nginx.conf:ro" \
+  -v "$PWD/index.html:/var/www/blipspeedtest/index.html:ro" \
+  -v "$PWD/dl:/var/www/blipspeedtest/dl:ro" \
+  nginx:stable
+```
+
 ## Files
 
 - `index.html` - the entire app (HTML + CSS + JS inline).
@@ -59,6 +76,18 @@ steady-state, and it's more stable than a raw max. The expandable panels show th
 full distribution (min / p25 / median / p75 / max) per file size if you want to
 see the spread.
 
+**Adaptive size ramp.** Within each direction the test starts at the smallest file
+and climbs: it spends a short slice at a size, estimates how long one file of the
+*next* size would take at the speed it just measured, and steps up only if that's
+comfortably under `CONFIG.bandwidthFinishRequestDuration` (1 s). Once a size's files
+would take longer than that (or the next size wouldn't fit in the time left) it
+stops climbing and spends the rest of the window at that largest feasible size. A
+fast link walks up to the 100 MB file and dwells there; a slow tunnel settles on,
+say, 10 MB instead of grinding on a 100 MB transfer it can't finish. The full phase
+window is always used either way, and the detail panels only show the sizes actually
+exercised. (This mirrors the ramp-up in Cloudflare's engine, adapted to our
+fixed-window model.)
+
 **Upload is measured by send-rate, and relies on nginx draining the body.**
 The browser can't see when bytes leave the NIC, so upload throughput comes from
 `XHR.upload.onprogress` deltas over the steady window, the real bytes pushed onto the
@@ -66,7 +95,7 @@ wire. nginx returns `204` and discards the body; it drains (reads + throws away)
 the request body *because keepalive is on*, which is what lets the browser finish
 sending. The exact moment the 204 comes back doesn't affect the measurement.
 
-**Packet loss is an estimate, not true loss, and it can't be otherwise here.**
+**Reliability is a packet-loss proxy, not true loss (and it can't be otherwise here).**
 nginx speaks HTTP over TCP, and TCP silently retransmits lost segments before any
 JavaScript sees them. Real IP-layer loss is invisible to a browser talking to an
 HTTP server; measuring it would need a UDP/WebRTC path (a TURN server), which this
@@ -77,7 +106,9 @@ high-latency tunnel doesn't get flagged with false positives. Only **timeouts**
 count toward the percentage; **hard errors** (connection refused/reset -> server
 actually unreachable) are surfaced separately as "couldn't reach server" and never
 folded into the loss number. Below `CONFIG.ping.minSamplesForLoss` (20) samples
-the figure is shown with a low-confidence caveat. On a VPN this is still useful:
+the figure is shown with a low-confidence caveat. The card surfaces this inverted as
+a **Reliability** percentage (`100 − the timeout rate`, so higher is better); the
+copied report uses the same figure. On a VPN this is still useful:
 a misconfigured tunnel MTU or fragmentation tends to show up here as elevated
 timeouts and jitter.
 
@@ -85,7 +116,11 @@ timeouts and jitter.
 (the successful RTTs double as the latency samples). During the download and
 upload phases a concurrent probe records latency *under load* - that's the
 bufferbloat figure, and it's usually the more honest number for real-world feel.
-Jitter is the average gap between consecutive RTTs.
+Jitter is the average gap between consecutive RTTs. Latency comes from the browser's
+Resource Timing API (`responseStart − requestStart`) rather than a wall-clock timer,
+so XHR scheduling and event-loop jitter stay out of the number; the loaded probe is
+throttled (~400 ms apart) and capped at the most recent 20 samples so it doesn't
+congest the very transfer it's measuring.
 
 **HTTP/1.1 vs HTTP/2.** The vhost ships on HTTP/1.1 on purpose. Under HTTP/2 the 6
 "parallel" requests multiplex onto a single connection and a single congestion
@@ -117,12 +152,13 @@ jump as they update. Orange = download, violet = upload throughout.
 - **Not true packet loss.** See above, it's an HTTP-timeout proxy. Don't quote it
   as a hard loss percentage.
 - **Single endpoint.** No geo-distributed servers; it tests one path only.
-- **Uses real bandwidth, and a lot of it.** The largest probe is 100 MB and it runs
-  over 6 parallel streams, so a fast link can move several hundred MB up to ~1 GB+
-  per run, and the test auto-starts on every page load. That's fine on your own
-  infra (the point is to saturate the tunnel), but drop the 100 MB entry from
-  `download[]`/`upload[]`, lower the weights, or shorten `testDurationSec` if you
-  want to rein it in.
+- **Uses real bandwidth, and a lot of it.** The largest probe is 100 MB over 6
+  parallel streams, so a fast link can move several hundred MB up to ~1 GB+ per run,
+  and the test auto-starts on every page load. That's fine on your own infra (the
+  point is to saturate the tunnel). A slow link no longer grinds on the 100 MB file,
+  the adaptive ramp stops climbing and dwells on a smaller size, but to rein in a
+  fast link, drop the 100 MB entry from `download[]`/`upload[]` or shorten
+  `testDurationSec`.
 - **TCP/HTTP throughput**, not raw UDP. Very high-bandwidth links can also bump
   into browser/JS overhead before they hit the real ceiling.
 - **No history or storage** beyond the theme preference (saved in `localStorage`,
@@ -138,9 +174,17 @@ All in the `CONFIG` object at the top of the script:
 - `sampleIntervalMs` - throughput sampling + chart cadence.
 - `ping.floorMs`, `ping.baselineMult` - the adaptive loss/latency timeout
   (`max(floorMs, baselineMult × baseline median)`).
-- `ping.minSamplesForLoss` - below this, the loss figure is caveated.
-- `download[]` / `upload[]` - file sizes and their `weight` (share of the phase
-  window). The `download` entries' `file` names must match `make-files.sh`.
+- `ping.minSamplesForLoss` - below this, the reliability figure is caveated.
+- `loadedLatencyThrottleMs` / `loadedLatencyMaxPoints` - spacing and cap for the
+  under-load latency probes.
+- `bandwidthFinishRequestDuration` / `rampSliceMs` - the adaptive size ramp: stop
+  climbing once one file at a size would take this long, and how long to probe each
+  size on the way up.
+- `estimatedServerTime` - ms subtracted from latency when no `Server-Timing` header
+  is present (0 for static nginx).
+- `minSampleFracOfInterval` - discards throughput samples from anomalously short ticks.
+- `download[]` / `upload[]` - file sizes, listed ascending (the ramp decides how far
+  up to climb). The `download` entries' `file` names must match `make-files.sh`.
 
 ## Support
 
