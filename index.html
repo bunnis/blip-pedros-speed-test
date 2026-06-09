@@ -1,0 +1,1032 @@
+<!DOCTYPE html>
+<!--
+  Blip - single self-contained page, no external dependencies, runs on bare nginx.
+  Built by Pedro · Inspired by Cloudflare Speed Test; not affiliated with Cloudflare. MIT licensed.
+
+  Orientation (the rest is recoverable from the code; this is what isn't):
+  - One knob drives everything: CONFIG.testDurationSec. Phase windows, sampling and the
+    progress bar all derive from it, so changing that single number rescales the whole test.
+  - Each phase runs its FULL allotted window (it does not stop early on "enough samples"),
+    so a longer test means more measurement and the reported figures cover the whole window.
+  - Throughput is AGGREGATE across parallel streams (the real link speed), sampled every
+    CONFIG.sampleIntervalMs. Headline = 90th percentile of those samples (the 90th pct, like
+    Cloudflare, naturally discounts TCP slow-start instead of us hand-trimming a ramp).
+  - Packet loss here is an HTTP-timeout proxy, NOT true IP-layer loss (TCP repairs real loss
+    before JS sees it). The timeout is ADAPTIVE: max(floor, 3x measured baseline RTT) so a
+    naturally slow/VPN link is not falsely flagged. Only timeouts count as "lost"; hard
+    network errors are surfaced as "server unreachable", never folded into the loss number.
+  - Endpoints expected from nginx: GET /dl/<file> (incompressible static files), POST /upload
+    (returns 204, body discarded and also answers GET for pings), GET /ip (echoes client IP).
+  - Append ?demo=1 to preview the full animated UX with synthetic data and no server.
+-->
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Blip - Tunnel Speed Test</title>
+<style>
+  :root{
+    --dl:#ff7a1a; --dl-soft:rgba(255,122,26,.16);
+    --ul:#8b5cf6; --ul-soft:rgba(139,92,246,.16);
+    --good:#22c55e; --avg:#eab308; --bad:#ef4444;
+    --r:14px;
+    --font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --font-mono:ui-monospace,"SF Mono",SFMono-Regular,"Cascadia Mono","Roboto Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  [data-theme="dark"]{
+    --bg:#0c0f14; --bg2:#0f141b; --surface:#141a22; --surface-2:#1a212c;
+    --border:#232c39; --border-2:#2c3645;
+    --text:#e9eef4; --text-dim:#8a95a5; --text-faint:#5c6675;
+    --grid:#1f2733; --track:#1c2430; --shadow:0 1px 0 rgba(255,255,255,.03),0 8px 28px rgba(0,0,0,.45);
+  }
+  [data-theme="light"]{
+    --bg:#eef1f5; --bg2:#e9edf2; --surface:#ffffff; --surface-2:#f4f6f9;
+    --border:#e2e7ee; --border-2:#d4dbe4;
+    --text:#161b22; --text-dim:#5a6573; --text-faint:#929cab;
+    --grid:#eceff4; --track:#eef1f5; --shadow:0 1px 2px rgba(16,24,40,.04),0 12px 30px rgba(16,24,40,.08);
+  }
+  *{box-sizing:border-box}
+  html{overflow-x:hidden}
+  html,body{margin:0}
+  body{
+    background:
+      radial-gradient(1200px 600px at 80% -10%, var(--bg2), transparent 60%),
+      var(--bg);
+    color:var(--text); font-family:var(--font-sans);
+    -webkit-font-smoothing:antialiased; line-height:1.5;
+    padding:clamp(14px,3vw,34px);
+  }
+  .wrap{max-width:1060px;margin:0 auto}
+  .num{font-family:var(--font-mono);font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+
+  /* Header */
+  header{display:flex;align-items:center;gap:14px;margin-bottom:22px;flex-wrap:wrap}
+  .logo{display:flex;align-items:center;gap:11px}
+  .logo svg{width:30px;height:30px}
+  .logo h1{font-size:19px;font-weight:650;margin:0;letter-spacing:-.015em}
+  .logo .sub{font-size:11px;color:var(--text-faint);letter-spacing:.06em;text-transform:uppercase}
+  .header-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+  .ip-chip{font-family:var(--font-mono);font-size:12px;color:var(--text-dim);
+    background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:6px 12px;white-space:nowrap}
+  .ip-chip b{color:var(--text);font-weight:600}
+  .demo-badge{display:none;font-size:11px;font-weight:700;letter-spacing:.08em;color:#000;
+    background:var(--avg);border-radius:999px;padding:5px 10px}
+  body.demo .demo-badge{display:inline-block}
+  .tg{appearance:none;border:1px solid var(--border);background:var(--surface);color:var(--text-dim);
+    width:38px;height:38px;border-radius:11px;cursor:pointer;display:grid;place-items:center;transition:.15s;text-decoration:none}
+  .tg:hover{color:var(--text);border-color:var(--border-2)}
+  .tg svg{width:18px;height:18px}
+
+  /* Cards */
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow)}
+  .reveal{opacity:0;transform:translateY(10px);animation:rise .5s cubic-bezier(.2,.7,.3,1) forwards}
+  @keyframes rise{to{opacity:1;transform:none}}
+  @media (prefers-reduced-motion:reduce){.reveal{animation:none;opacity:1;transform:none}}
+
+  /* Readout grid */
+  .readouts{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+  @media(max-width:820px){.readouts{grid-template-columns:1fr}}
+  .speedcard{padding:18px 20px 8px}
+  .rc-head{display:flex;align-items:center;gap:7px;margin-bottom:2px}
+  .rc-head .dot{width:9px;height:9px;border-radius:3px}
+  .dl .dot{background:var(--dl)} .ul .dot{background:var(--ul)}
+  .rc-head .label{font-size:13px;font-weight:600;color:var(--text-dim);letter-spacing:.02em}
+  .big{display:flex;align-items:baseline;gap:8px;margin:2px 0 6px}
+  .big .v{font-size:clamp(44px,9vw,62px);font-weight:700;line-height:1}
+  .dl .big .v{color:var(--dl)} .ul .big .v{color:var(--ul)}
+  .big .u{font-size:15px;color:var(--text-dim);font-weight:600}
+  canvas.spark{width:100%;height:74px;display:block}
+
+  /* small stats column inside upload card row */
+  .stat-row{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:16px}
+  @media(max-width:560px){.stat-row{grid-template-columns:1fr}}
+  .statcard{padding:16px 18px}
+  .statcard .label{display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:var(--text-dim);margin-bottom:7px}
+  .statcard .v{font-size:30px;font-weight:700}
+  .statcard .v .u{font-size:13px;color:var(--text-dim);font-weight:600;margin-left:3px}
+
+  /* info tooltip */
+  .info{position:relative;display:inline-flex}
+  .i-btn{appearance:none;border:1px solid var(--border-2);background:transparent;color:var(--text-faint);
+    width:16px;height:16px;border-radius:50%;font-size:10px;font-weight:700;font-family:var(--font-sans);
+    cursor:pointer;line-height:1;display:grid;place-items:center;padding:0}
+  .i-btn:hover{color:var(--text);border-color:var(--text-dim)}
+  /* fixed-positioned so it never clips the viewport or the card's overflow; JS sets top/left */
+  .tip{position:fixed;top:0;left:0;
+    width:min(300px,86vw);background:#1c2430;color:#dfe6ef;border:1px solid var(--border-2);
+    border-radius:10px;padding:11px 13px;font-size:12.5px;line-height:1.5;font-family:var(--font-sans);font-weight:400;
+    box-shadow:0 14px 34px rgba(0,0,0,.45);opacity:0;pointer-events:none;transition:opacity .15s,transform .15s;
+    transform:translateY(4px);z-index:80;text-align:left}
+  [data-theme="light"] .tip{background:#202733;color:#eef1f6}
+  .tip b{color:#fff}
+  .tip::after{content:"";position:absolute;left:var(--arrow,50%);transform:translateX(-50%);border:6px solid transparent}
+  .tip.below::after{bottom:100%;border-bottom-color:#1c2430}
+  .tip.above::after{top:100%;border-top-color:#1c2430}
+  [data-theme="light"] .tip.below::after{border-bottom-color:#202733}
+  [data-theme="light"] .tip.above::after{border-top-color:#202733}
+  .tip.show{opacity:1;pointer-events:auto;transform:translateY(0)}
+
+  /* run / progress */
+  .runbar{padding:16px 18px;margin-bottom:16px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+  .run-btn{appearance:none;border:0;cursor:pointer;font-family:var(--font-sans);font-weight:650;font-size:15px;
+    color:#fff;background:var(--dl);padding:12px 26px;border-radius:11px;transition:.15s;white-space:nowrap}
+  .run-btn:hover{filter:brightness(1.06)} .run-btn:active{transform:translateY(1px)}
+  .run-btn.stop{background:var(--surface-2);color:var(--text);border:1px solid var(--border-2)}
+  .prog{flex:1;min-width:200px}
+  .prog-top{display:flex;align-items:center;flex-wrap:wrap;gap:9px;margin-bottom:8px;min-height:18px}
+  .spinner{width:14px;height:14px;border:2px solid var(--border-2);border-top-color:var(--dl);border-radius:50%;
+    animation:spin .7s linear infinite;display:none}
+  body.running .spinner{display:inline-block}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .phase{font-size:13px;font-weight:600;color:var(--text-dim)}
+  .phase .pct{font-family:var(--font-mono);color:var(--text-faint);font-weight:600}
+  .measured{font-size:12px;color:var(--text-faint);margin-left:auto;white-space:nowrap}
+  .measured:empty{display:none}
+  .track{height:8px;background:var(--track);border-radius:99px;overflow:hidden;position:relative}
+  .fill{height:100%;width:0;border-radius:99px;background:linear-gradient(90deg,var(--dl),#ffb066);transition:width .18s ease}
+  body.running .fill::after{content:"";position:absolute;inset:0;
+    background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent);
+    transform:translateX(-100%);animation:sheen 1.3s ease-in-out infinite}
+  @keyframes sheen{to{transform:translateX(220%)}}
+  .phases{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+  .pchip{font-size:11px;font-family:var(--font-mono);color:var(--text-faint);background:var(--surface-2);
+    border:1px solid var(--border);border-radius:7px;padding:3px 8px;transition:.2s}
+  .pchip.active{color:var(--text);border-color:var(--dl);background:var(--dl-soft)}
+  .pchip.done{color:var(--good);border-color:transparent}
+
+  /* banner */
+  .banner{display:none;align-items:flex-start;gap:10px;padding:13px 16px;margin-bottom:16px;border-radius:12px;
+    background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.4);color:var(--text);font-size:13.5px}
+  .banner.show{display:flex}
+  .banner svg{width:18px;height:18px;flex:none;color:var(--bad);margin-top:1px}
+
+  /* NQS */
+  .nqs{padding:16px 20px;margin-bottom:16px}
+  .nqs-head{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:600;color:var(--text-dim);margin-bottom:12px}
+  .nqs-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+  @media(max-width:560px){.nqs-grid{grid-template-columns:1fr}}
+  .nqs-item{display:flex;align-items:center;justify-content:space-between;gap:10px;
+    background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:11px 14px}
+  .nqs-item .k{font-size:13px;color:var(--text-dim)}
+  .nqs-item .badge{font-size:12.5px;font-weight:700;padding:3px 10px;border-radius:99px;font-family:var(--font-mono)}
+  .b-good{color:var(--good);background:rgba(34,197,94,.13)}
+  .b-avg{color:var(--avg);background:rgba(234,179,8,.14)}
+  .b-bad{color:var(--bad);background:rgba(239,68,68,.13)}
+  .b-idle{color:var(--text-faint);background:var(--surface)}
+
+  /* actions */
+  .actions{display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap}
+  .ghost{appearance:none;cursor:pointer;font-family:var(--font-sans);font-weight:600;font-size:13.5px;
+    color:var(--text);background:var(--surface);border:1px solid var(--border-2);padding:10px 16px;border-radius:10px;
+    display:inline-flex;align-items:center;gap:8px;transition:.15s}
+  .ghost:hover:not(:disabled){border-color:var(--text-dim)}
+  .ghost:disabled{opacity:.5;cursor:not-allowed}
+  .ghost svg{width:15px;height:15px}
+
+  /* details / measurements */
+  .meas{margin-bottom:14px;overflow:hidden}
+  .meas>summary{list-style:none;cursor:pointer;padding:15px 18px;display:flex;align-items:center;gap:8px;
+    font-size:14px;font-weight:600;color:var(--text)}
+  .meas>summary::-webkit-details-marker{display:none}
+  .meas>summary .chev{margin-left:auto;color:var(--text-faint);transition:.2s}
+  .meas[open]>summary .chev{transform:rotate(180deg)}
+  .meas>summary .hint{font-size:12px;color:var(--text-faint);font-weight:500;font-family:var(--font-mono)}
+  .meas-body{padding:2px 18px 16px}
+  .brow{padding:11px 0;border-top:1px solid var(--border)}
+  .brow:first-child{border-top:0}
+  .brow-top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:9px}
+  .brow-top .bl{font-size:13px;color:var(--text)} .brow-top .bn{font-size:11.5px;color:var(--text-faint);font-family:var(--font-mono)}
+  .plot{position:relative;height:30px}
+  .axis{position:absolute;inset:0}
+  .axis i{position:absolute;top:0;bottom:14px;width:1px;background:var(--grid)}
+  .axis span{position:absolute;bottom:0;transform:translateX(-50%);font-size:9.5px;color:var(--text-faint);font-family:var(--font-mono)}
+  .whisk{position:absolute;top:9px;height:2px;background:var(--border-2)}
+  .whisk i{position:absolute;top:-4px;width:2px;height:10px;background:var(--border-2)}
+  .box{position:absolute;top:4px;height:12px;border-radius:3px;opacity:.9}
+  .med{position:absolute;top:2px;width:2px;height:16px;border-radius:2px}
+  .mean{position:absolute;top:3px;width:0;height:14px;border-left:2px dotted var(--text)}
+  .dot{position:absolute;top:13px;width:4px;height:4px;border-radius:50%;transform:translate(-50%,-50%);opacity:.55}
+  .dl-plot .box{background:var(--dl)} .dl-plot .med{background:#7a3500} .dl-plot .dot,.dl-plot .whisk,.dl-plot .whisk i{background:var(--dl)}
+  .dl-plot .whisk,.dl-plot .whisk i{opacity:.5}
+  .ul-plot .box{background:var(--ul)} .ul-plot .med{background:#3b1d80} .ul-plot .dot,.ul-plot .whisk,.ul-plot .whisk i{background:var(--ul)}
+  .ul-plot .whisk,.ul-plot .whisk i{opacity:.5}
+  .lat-plot .box{background:#3b82f6} .lat-plot .med{background:#16407e} .lat-plot .dot,.lat-plot .whisk,.lat-plot .whisk i{background:#3b82f6}
+  .lat-plot .whisk,.lat-plot .whisk i{opacity:.5}
+  .empty{color:var(--text-faint);font-size:12.5px;padding:6px 0}
+
+  footer{color:var(--text-faint);font-size:11.5px;line-height:1.6;margin-top:8px}
+  footer a{color:var(--text-dim)}
+
+  /* toast */
+  .toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);
+    background:var(--text);color:var(--bg);font-size:13px;font-weight:600;padding:10px 18px;border-radius:99px;
+    opacity:0;pointer-events:none;transition:.25s;z-index:60}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+<div class="wrap" id="app">
+
+  <header class="reveal">
+    <div class="logo">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M3 13.5L8 11l3 2 4-6 3 1.5" stroke="var(--dl)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="6" r="2" fill="var(--ul)"/></svg>
+      <div><h1>Blip Speed Test</h1><div class="sub">connection speed test · by Pedro</div></div>
+    </div>
+    <div class="header-right">
+      <span class="demo-badge">DEMO DATA</span>
+      <span class="ip-chip">IP <b id="ip-value">…</b></span>
+      <!-- GitHub: replace both PLACEHOLDER hrefs with your repo URL -->
+      <a class="tg" href="PLACEHOLDER" target="_blank" rel="noopener noreferrer" aria-label="View source on GitHub"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg></a>
+      <button class="tg" id="theme-toggle" aria-label="Toggle light/dark theme"></button>
+    </div>
+  </header>
+
+  <div class="banner" id="banner">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span id="banner-text"></span>
+  </div>
+
+  <div class="readouts">
+    <div class="card speedcard dl reveal" style="animation-delay:.04s">
+      <div class="rc-head">
+        <span class="dot"></span><span class="label">Download</span>
+        <span class="info"><button class="i-btn" aria-label="What is download speed?" aria-expanded="false">i</button>
+          <span class="tip" role="tooltip">How fast your connection pulls data from this server, it matters for loading pages, streaming and downloads. We download files of increasing size over several parallel connections. The headline is the <b>90th-percentile</b> speed: sort every sample and take the point 90% of them fall at or below, which is close to your best sustained speed, ignoring brief dips and the slow start at the beginning of each transfer.</span></span>
+      </div>
+      <div class="big"><span class="v num" id="dl-value">-</span><span class="u">Mbps</span></div>
+      <canvas class="spark" id="dl-chart"></canvas>
+    </div>
+    <div class="card speedcard ul reveal" style="animation-delay:.08s">
+      <div class="rc-head">
+        <span class="dot"></span><span class="label">Upload</span>
+        <span class="info"><button class="i-btn" aria-label="What is upload speed?" aria-expanded="false">i</button>
+          <span class="tip" role="tooltip">How fast your connection pushes data to this server, it matters for video calls, backups and sending files. Measured over several parallel connections. The headline is the <b>90th-percentile</b> speed: sort every sample and take the point 90% of them fall at or below, which is close to your best sustained speed rather than the peak or the average.</span></span>
+      </div>
+      <div class="big"><span class="v num" id="ul-value">-</span><span class="u">Mbps</span></div>
+      <canvas class="spark" id="ul-chart"></canvas>
+    </div>
+  </div>
+
+  <div class="stat-row">
+    <div class="card statcard reveal" style="animation-delay:.12s">
+      <div class="label">Latency
+        <span class="info"><button class="i-btn" aria-label="What is latency?" aria-expanded="false">i</button>
+          <span class="tip" role="tooltip">Round-trip time: how long a small request takes to reach the server and come back, measured while the line is idle. Lower is better, it's what makes a connection feel responsive. We report the median of many samples.</span></span>
+      </div>
+      <div class="v num"><span id="lat-value">-</span><span class="u">ms</span></div>
+    </div>
+    <div class="card statcard reveal" style="animation-delay:.15s">
+      <div class="label">Jitter
+        <span class="info"><button class="i-btn" aria-label="What is jitter?" aria-expanded="false">i</button>
+          <span class="tip" role="tooltip">How much the round-trip time varies from one request to the next. Even with low latency, high jitter disrupts calls and games. Calculated as the average change between consecutive measurements; lower is better.</span></span>
+      </div>
+      <div class="v num"><span id="jit-value">-</span><span class="u">ms</span></div>
+    </div>
+    <div class="card statcard reveal" style="animation-delay:.18s">
+      <div class="label">Packet&nbsp;Loss
+        <span class="info"><button class="i-btn" aria-label="What is packet loss?" aria-expanded="false">i</button>
+          <span class="tip" role="tooltip"><b>Estimated.</b> A browser can't see true packet loss since it happens below HTTP, and TCP silently re-sends dropped packets before your code notices. Instead we send a burst of tiny requests and count how many don't reply within a short window. For a live call or game, a reply that arrives too late is as good as lost, so this is a practical "is my connection dropping or stalling?" proxy, not a true network-layer figure. The window is scaled to your own baseline latency so a slow link isn't unfairly penalised. Lower is better.</span></span>
+      </div>
+      <div class="v num"><span id="loss-value">-</span><span class="u">%</span></div>
+    </div>
+  </div>
+
+  <div class="card runbar reveal" style="animation-delay:.2s">
+    <button class="run-btn" id="run-btn">Start test</button>
+    <div class="prog">
+      <div class="prog-top">
+        <span class="spinner"></span>
+        <span class="phase" id="phase-label">Ready</span>
+        <span class="phase pct" id="prog-pct"></span>
+        <span class="measured" id="measured-at"></span>
+      </div>
+      <div class="track"><div class="fill" id="prog-fill"></div></div>
+      <div class="phases" id="phase-chips">
+        <span class="pchip" data-phase="latency">latency · loss</span>
+        <span class="pchip" data-phase="download">download</span>
+        <span class="pchip" data-phase="upload">upload</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card nqs reveal" style="animation-delay:.24s">
+    <div class="nqs-head">Network Quality Score
+      <span class="info"><button class="i-btn" aria-label="About the quality score" aria-expanded="false">i</button>
+        <span class="tip" role="tooltip">A rough rating of how well your connection suits each activity, derived from the measurements above. Streaming leans on download; gaming on latency, jitter and loss; video chat on upload plus latency and jitter. Thresholds are heuristic guidance, not a guarantee.</span></span>
+    </div>
+    <div class="nqs-grid">
+      <div class="nqs-item"><span class="k">Video Streaming</span><span class="badge b-idle" id="nqs-stream">-</span></div>
+      <div class="nqs-item"><span class="k">Online Gaming</span><span class="badge b-idle" id="nqs-game">-</span></div>
+      <div class="nqs-item"><span class="k">Video Chatting</span><span class="badge b-idle" id="nqs-chat">-</span></div>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button class="ghost" id="copy-btn" disabled>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" stroke-linecap="round"/></svg>
+      Copy results
+    </button>
+  </div>
+
+  <details class="card meas" id="meas-dl">
+    <summary>Download Measurements <span class="hint" id="hint-dl"></span><span class="info"><button class="i-btn" aria-label="How to read these" aria-expanded="false">i</button><span class="tip" role="tooltip">Your speed for each file size we tested. Each bar shows the spread of results for that size: the shaded <b>box</b> is where most samples landed, the <b>line</b> inside it is the typical (middle) result, and the <b>dots</b> are the individual samples - further right is faster. Bigger files usually run faster because there's less overhead per request.</span></span><svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6" stroke-linecap="round" stroke-linejoin="round"/></svg></summary>
+    <div class="meas-body" id="body-dl"><div class="empty">Run a test to see the distribution of speeds by file size.</div></div>
+  </details>
+  <details class="card meas" id="meas-ul">
+    <summary>Upload Measurements <span class="hint" id="hint-ul"></span><span class="info"><button class="i-btn" aria-label="How to read these" aria-expanded="false">i</button><span class="tip" role="tooltip">Your speed for each file size we tested. Each bar shows the spread of results for that size: the shaded <b>box</b> is where most samples landed, the <b>line</b> inside it is the typical (middle) result, and the <b>dots</b> are the individual samples - further right is faster. Bigger files usually run faster because there's less overhead per request.</span></span><svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6" stroke-linecap="round" stroke-linejoin="round"/></svg></summary>
+    <div class="meas-body" id="body-ul"><div class="empty">Run a test to see the distribution of speeds by file size.</div></div>
+  </details>
+  <details class="card meas" id="meas-lat">
+    <summary>Latency Measurements <span class="hint" id="hint-lat"></span><span class="info"><button class="i-btn" aria-label="How to read these" aria-expanded="false">i</button><span class="tip" role="tooltip">Response time when the connection is idle versus while a download or upload is running flat out. A big jump under load is <b>bufferbloat</b> - what makes video calls and games stutter while something else is downloading. Further left is better; the <b>line</b> is the typical result and the <b>dots</b> are individual samples.</span></span><svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6" stroke-linecap="round" stroke-linejoin="round"/></svg></summary>
+    <div class="meas-body" id="body-lat"><div class="empty">Run a test to see latency when idle and under load.</div></div>
+  </details>
+
+  <footer>
+    Measures the network path between your browser and this server. The results reflect that path, not necessarily your ISP's maximum. Packet loss is an HTTP-timeout estimate, not true IP-layer loss.
+    <br>Built by Pedro · Inspired by Cloudflare Speed Test; not affiliated with Cloudflare. MIT licensed. · <a href="PLACEHOLDER" target="_blank" rel="noopener noreferrer">Source on GitHub</a>
+  </footer>
+</div>
+
+<div class="toast" id="toast">Copied to clipboard</div>
+
+<script>
+"use strict";
+
+/* ============================ CONFIG ============================ */
+const CONFIG = {
+  testDurationSec: 30,                          // ⬅ master knob: total wall-clock length of the test, in seconds
+  phaseWeights: { latency: 1, download: 2, upload: 2 }, // how the duration is split across phases
+  parallelStreams: 6,                           // concurrent connections per transfer phase
+  sampleIntervalMs: 200,                         // throughput sampling cadence (also chart cadence)
+
+  ping: {
+    floorMs: 300,            // timeout floor; effective timeout = max(floorMs, baselineMult * baseline median)
+    baselineMult: 3,
+    warmupCount: 8,          // pings used to establish the baseline before the adaptive timeout kicks in
+    warmupTimeoutMs: 2000,
+    minSamplesForLoss: 20,   // below this, loss % is shown with a caveat
+  },
+
+  endpoints: { upload: "/upload", ip: "/ip", dlBase: "/dl/" },
+
+  // Files must exist as incompressible static files (see make-files.sh). weight = share of the download window.
+  download: [
+    { bytes: 102400,    file: "100kb.bin", label: "100 kB", weight: 1 },
+    { bytes: 1048576,   file: "1mb.bin",   label: "1 MB",   weight: 1 },
+    { bytes: 10485760,  file: "10mb.bin",  label: "10 MB",  weight: 2 },
+    { bytes: 26214400,  file: "25mb.bin",  label: "25 MB",  weight: 3 },
+    { bytes: 104857600, file: "100mb.bin", label: "100 MB", weight: 4 },
+  ],
+  // Upload payloads are generated client-side; weight = share of the upload window.
+  upload: [
+    { bytes: 102400,    label: "100 kB", weight: 1 },
+    { bytes: 1048576,   label: "1 MB",   weight: 1 },
+    { bytes: 10485760,  label: "10 MB",  weight: 2 },
+    { bytes: 26214400,  label: "25 MB",  weight: 3 },
+    { bytes: 104857600, label: "100 MB", weight: 4 },
+  ],
+};
+
+const DEMO = new URLSearchParams(location.search).has("demo");
+
+/* ============================ helpers ============================ */
+const $ = (id) => document.getElementById(id);
+const now = () => performance.now();
+const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
+const rnd = () => Math.random().toString(36).slice(2);
+const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
+
+function pct(arr, p) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  const i = (s.length - 1) * p, lo = Math.floor(i), hi = Math.ceil(i);
+  return lo === hi ? s[lo] : s[lo] + (s[hi] - s[lo]) * (i - lo);
+}
+function statsOf(arr) {
+  if (!arr.length) return null;
+  return {
+    n: arr.length, min: Math.min(...arr), max: Math.max(...arr),
+    avg: arr.reduce((a, b) => a + b, 0) / arr.length,
+    p25: pct(arr, 0.25), median: pct(arr, 0.5), p75: pct(arr, 0.75), p90: pct(arr, 0.9),
+  };
+}
+function jitterOf(arr) {
+  if (arr.length < 2) return 0;
+  let s = 0; for (let i = 1; i < arr.length; i++) s += Math.abs(arr[i] - arr[i - 1]);
+  return s / (arr.length - 1);
+}
+const fmtMbps = (v) => v == null ? "-" : (v >= 100 ? Math.round(v).toString() : v.toFixed(1));
+const fmtMs = (v) => v == null ? "-" : (v >= 100 ? Math.round(v).toString() : v.toFixed(1));
+const fmtLoss = (v) => v == null ? "-" : (v === 0 ? "0" : v.toFixed(1));
+
+/* ============================ state ============================ */
+let state, stopFlag = false, running = false, progTimer = null;
+function freshState() {
+  return {
+    t0: 0, totalMs: CONFIG.testDurationSec * 1000,
+    ip: null, unreachable: false, baseline: 0, pingTimeout: CONFIG.ping.floorMs,
+    dlChart: [], upChart: [], totalBytes: 0,
+    dlSamples: [], upSamples: [],                       // aggregate-throughput samples (for headline p90)
+    detail: { download: [], upload: [] },               // [{label, samples}]
+    rttUnloaded: [], loaded: { download: [], upload: [] },
+    loss: null, hardErrors: 0, lossSent: 0,
+    activePhase: null, finishedAt: null,
+  };
+}
+
+/* ============================ network primitives ============================ */
+function getIP() {
+  if (DEMO) { state.ip = "203.0.113.42"; return Promise.resolve(); }
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), 4000);
+  return fetch(CONFIG.endpoints.ip, { cache: "no-store", signal: ctrl.signal })
+    .then((r) => r.text()).then((t) => { state.ip = (t || "").trim() || "-"; })
+    .catch(() => { state.ip = "-"; })
+    .finally(() => clearTimeout(to));
+}
+
+// Resolves with RTT (ms) on a completed reply; rejects {type:'timeout'|'error'}.
+function pingOnce(timeoutMs) {
+  if (DEMO) {
+    const base = (state.baseline || 28) * (state.demoLoad || 1);
+    const v = Math.max(2, base + (Math.random() + Math.random() + Math.random() - 1.5) * base * 0.4);
+    const dropChance = 0.012 * (state.demoLoad || 1);
+    return new Promise((res, rej) => setTimeout(() => Math.random() < dropChance ? rej({ type: "timeout" }) : res(v), v));
+  }
+  return new Promise((res, rej) => {
+    const xhr = new XMLHttpRequest();
+    const t = now();
+    xhr.open("GET", CONFIG.endpoints.upload + "?pl=" + rnd(), true); // GET on /upload -> 204, tiny, no body
+    xhr.timeout = timeoutMs;
+    xhr.onload = () => res(now() - t);
+    xhr.onerror = () => rej({ type: "error" });
+    xhr.ontimeout = () => rej({ type: "timeout" });
+    try { xhr.send(); } catch (_) { rej({ type: "error" }); }
+  });
+}
+
+// Reusable random buffer so we never re-randomise per upload (cheap, incompressible enough on the wire).
+const RAND_BUF = (() => {
+  const n = 1 << 20, a = new Uint8Array(n), c = 65536;
+  for (let o = 0; o < n; o += c) crypto.getRandomValues(a.subarray(o, Math.min(o + c, n)));
+  return a;
+})();
+function makeBlob(bytes) {
+  const parts = []; let rem = bytes;
+  while (rem > 0) { const take = Math.min(rem, RAND_BUF.byteLength); parts.push(take === RAND_BUF.byteLength ? RAND_BUF : RAND_BUF.subarray(0, take)); rem -= take; }
+  return new Blob(parts, { type: "application/octet-stream" });
+}
+
+// Download worker: stream a file, counting bytes, looping until the phase deadline.
+async function dlWorker(file, deadline, ctrl, counter) {
+  while (now() < deadline && !ctrl.signal.aborted && !stopFlag) {
+    try {
+      const res = await fetch(CONFIG.endpoints.dlBase + file + "?cb=" + rnd(), { cache: "no-store", signal: ctrl.signal });
+      if (!res.ok || !res.body) { await sleep(20); continue; }
+      const reader = res.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        counter.bytes += value.length;
+        if (now() >= deadline) { try { ctrl.abort(); } catch (_) {} break; }
+      }
+    } catch (_) { if (ctrl.signal.aborted) break; await sleep(20); }
+  }
+}
+
+// Upload worker: POST a blob (timed by send-rate via onprogress), looping until the phase deadline.
+function uploadOnce(blob, onProgress, signal) {
+  return new Promise((res, rej) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", CONFIG.endpoints.upload, true);
+    let last = 0;
+    xhr.upload.onprogress = (e) => { onProgress(e.loaded - last); last = e.loaded; };
+    xhr.onload = () => res();          // 204
+    xhr.onerror = () => rej(new Error("net"));
+    xhr.onabort = () => rej(new Error("abort"));
+    const onAbort = () => { try { xhr.abort(); } catch (_) {} };
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    try { xhr.send(blob); } catch (_) { rej(new Error("net")); }
+  });
+}
+async function upWorker(bytes, deadline, ctrl, counter) {
+  const blob = makeBlob(bytes);
+  while (now() < deadline && !ctrl.signal.aborted && !stopFlag) {
+    try { await uploadOnce(blob, (d) => { counter.bytes += d; }, ctrl.signal); }
+    catch (_) { if (ctrl.signal.aborted) break; await sleep(15); }
+  }
+}
+
+/* synthetic throughput for DEMO (Mbps), ramping with file size like a real link */
+function synthMbps(kind, size) {
+  const map = kind === "download"
+    ? { 102400: 70, 1048576: 200, 10485760: 380, 26214400: 445 }
+    : { 102400: 35, 1048576: 110, 10485760: 230, 26214400: 270 };
+  const base = map[size.bytes] || 100;
+  return Math.max(1, base + (Math.random() + Math.random() + Math.random() - 1.5) * base * 0.22);
+}
+
+/* ============================ phases ============================ */
+async function phaseLatencyLoss(durationMs) {
+  setPhase("latency", "Measuring latency & packet loss");
+  const deadline = now() + durationMs;
+
+  // warm-up establishes the baseline that sizes the adaptive timeout
+  const warm = [];
+  for (let i = 0; i < CONFIG.ping.warmupCount && now() < deadline && !stopFlag; i++) {
+    try { warm.push(await pingOnce(CONFIG.ping.warmupTimeoutMs)); } catch (_) {}
+  }
+  state.baseline = warm.length ? pct(warm, 0.5) : 0;
+  state.pingTimeout = Math.max(CONFIG.ping.floorMs, Math.round((state.baseline || 50) * CONFIG.ping.baselineMult));
+
+  const rtts = warm.slice();
+  let received = warm.length, timeouts = 0, hard = 0;
+  while (now() < deadline && !stopFlag) {
+    try { const r = await pingOnce(state.pingTimeout); rtts.push(r); received++; }
+    catch (e) { if (e && e.type === "timeout") timeouts++; else hard++; }
+  }
+  state.rttUnloaded = rtts;
+  state.hardErrors = hard;
+  if (received === 0) { state.unreachable = true; return; }
+  const eff = received + timeouts;
+  state.lossSent = eff;
+  state.loss = eff > 0 ? (timeouts / eff) * 100 : 0;
+}
+
+async function measureSize(kind, size, deadline) {
+  const ctrl = new AbortController();
+  const counter = { bytes: 0 };
+  const samples = [];
+  const workers = DEMO ? [] : Array.from({ length: CONFIG.parallelStreams }, () =>
+    kind === "download" ? dlWorker(size.file, deadline, ctrl, counter) : upWorker(size.bytes, deadline, ctrl, counter));
+
+  let last = now(), lastBytes = 0;
+  await new Promise((resolve) => {
+    const id = setInterval(() => {
+      const t = now(), dt = (t - last) / 1000;
+      let mbps;
+      if (DEMO) { mbps = synthMbps(kind, size); counter.bytes += (mbps * 1e6 * dt) / 8; }
+      else { mbps = dt > 0 ? ((counter.bytes - lastBytes) * 8) / dt / 1e6 : 0; }
+      last = t; lastBytes = counter.bytes;
+      samples.push(mbps);
+      pushChart(kind, mbps);
+      if (now() >= deadline || stopFlag) { clearInterval(id); resolve(); }
+    }, CONFIG.sampleIntervalMs);
+  });
+
+  try { ctrl.abort(); } catch (_) {}
+  await Promise.allSettled(workers);
+  state.totalBytes += counter.bytes;
+  return samples;
+}
+
+async function phaseTransfer(kind, durationMs) {
+  setPhase(kind, kind === "download" ? "Measuring download speed" : "Measuring upload speed");
+  if (DEMO) state.demoLoad = kind === "download" ? 2.6 : 2.0;
+
+  const plan = (kind === "download" ? CONFIG.download : CONFIG.upload);
+  const wsum = plan.reduce((a, s) => a + s.weight, 0);
+  const phaseDeadline = now() + durationMs;
+
+  // concurrent loaded-latency probe (bufferbloat): only successful RTTs are recorded
+  const loadedRtts = [];
+  const loadedStop = { v: false };
+  const loadedLoop = (async () => {
+    while (!loadedStop.v && now() < phaseDeadline && !stopFlag) {
+      try { loadedRtts.push(await pingOnce(state.pingTimeout)); } catch (_) {}
+    }
+  })();
+
+  for (const size of plan) {
+    if (stopFlag || now() >= phaseDeadline) break;
+    const subDeadline = Math.min(phaseDeadline, now() + (durationMs * size.weight) / wsum);
+    const samples = await measureSize(kind, size, subDeadline);
+    state.detail[kind].push({ label: size.label, samples });
+    (kind === "download" ? state.dlSamples : state.upSamples).push(...samples);
+  }
+
+  loadedStop.v = true; await loadedLoop;
+  if (DEMO) state.demoLoad = 1;
+  state.loaded[kind] = loadedRtts;
+}
+
+/* ============================ orchestration ============================ */
+async function runTest() {
+  if (running) { stopTest(); return; }
+  state = freshState();
+  setRunning(true);
+  hideBanner();
+  resetReadouts();
+
+  try {
+    await getIP();
+    renderIP();
+
+    const total = state.totalMs, w = CONFIG.phaseWeights, sum = w.latency + w.download + w.upload;
+    state.t0 = now();
+    startProgressTimer();
+
+    await phaseLatencyLoss((total * w.latency) / sum);
+    if (state.unreachable) { showUnreachable(); return; }
+
+    await phaseTransfer("download", (total * w.download) / sum);
+    if (stopFlag) return;
+    await phaseTransfer("upload", (total * w.upload) / sum);
+
+    finalize();
+  } catch (e) {
+    showBanner("Something went wrong during the test. " + (e && e.message ? e.message : ""));
+  } finally {
+    setRunning(false);
+  }
+}
+
+function stopTest() { stopFlag = true; }
+
+function fmtClock(d) { return [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, "0")).join(":"); }
+
+function finalize() {
+  state.finishedAt = new Date();
+  refreshReadouts(true);
+  renderDetails();
+  $("phase-label").textContent = "Done";
+  markChips("done");
+  setProgress(1);
+  $("measured-at").innerHTML = 'measured at <span class="num">' + fmtClock(state.finishedAt) + "</span>";
+  $("copy-btn").disabled = false;
+}
+
+/* ============================ UI: progress / readouts ============================ */
+function setPhase(phase, label) {
+  state.activePhase = phase;
+  $("phase-label").textContent = label;
+  document.querySelectorAll(".pchip").forEach((c) => {
+    c.classList.toggle("active", c.dataset.phase === phase);
+  });
+}
+function markChips(cls) {
+  document.querySelectorAll(".pchip").forEach((c) => { c.classList.remove("active"); c.classList.add(cls); });
+}
+function setProgress(frac) {
+  const p = clamp(frac, 0, 1);
+  $("prog-fill").style.width = (p * 100).toFixed(1) + "%";
+  $("prog-pct").textContent = Math.round(p * 100) + "%";
+}
+function startProgressTimer() {
+  clearInterval(progTimer);
+  progTimer = setInterval(() => {
+    if (!running) return;
+    setProgress((now() - state.t0) / state.totalMs);
+    refreshReadouts(false);
+  }, 120);
+}
+function setRunning(on) {
+  running = on;
+  document.body.classList.toggle("running", on);
+  if (on) stopFlag = false;
+  const btn = $("run-btn");
+  btn.textContent = on ? "Stop" : "Retest";
+  btn.classList.toggle("stop", on);
+  if (!on) clearInterval(progTimer);
+}
+
+function resetReadouts() {
+  $("measured-at").textContent = "";
+  ["dl-value", "ul-value", "lat-value", "jit-value", "loss-value"].forEach((id) => $(id).textContent = "-");
+  setNQS("nqs-stream", "-", "b-idle"); setNQS("nqs-game", "-", "b-idle"); setNQS("nqs-chat", "-", "b-idle");
+  drawChart($("dl-chart"), [], "--dl", 0);
+  drawChart($("ul-chart"), [], "--ul", 0);
+}
+
+// Recompute live (final=true uses 90th-percentile headline; otherwise a smoothed running figure).
+function refreshReadouts(final) {
+  // download / upload headline
+  const dlHead = final ? (state.dlSamples.length ? pct(state.dlSamples, 0.9) : null) : recent(state.dlChart);
+  const upHead = final ? (state.upSamples.length ? pct(state.upSamples, 0.9) : null) : recent(state.upChart);
+  if (dlHead != null) $("dl-value").textContent = fmtMbps(dlHead);
+  if (upHead != null) $("ul-value").textContent = fmtMbps(upHead);
+
+  // latency / jitter / loss from unloaded RTTs
+  if (state.rttUnloaded.length) {
+    $("lat-value").textContent = fmtMs(pct(state.rttUnloaded, 0.5));
+    $("jit-value").textContent = fmtMs(jitterOf(state.rttUnloaded));
+  }
+  if (state.loss != null) $("loss-value").textContent = fmtLoss(state.loss);
+
+  // charts
+  const dlRef = state.dlSamples.length ? pct(state.dlSamples, 0.9) : recent(state.dlChart);
+  const upRef = state.upSamples.length ? pct(state.upSamples, 0.9) : recent(state.upChart);
+  drawChart($("dl-chart"), state.dlChart, "--dl", dlRef);
+  drawChart($("ul-chart"), state.upChart, "--ul", upRef);
+
+  if (final) renderNQS();
+}
+function recent(arr) {
+  if (!arr.length) return null;
+  const slice = arr.slice(-5);
+  return slice.reduce((a, b) => a + b, 0) / slice.length;
+}
+
+function renderIP() {
+  $("ip-value").textContent = state.ip || "-";
+}
+
+/* ============================ charts ============================ */
+function pushChart(kind, mbps) {
+  const arr = kind === "download" ? state.dlChart : state.upChart;
+  arr.push(mbps);
+  if (arr.length > 320) arr.shift();
+}
+function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+function drawChart(canvas, data, colorVar, refVal) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 300, h = canvas.clientHeight || 74;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const color = cssVar(colorVar);
+  const grid = cssVar("--grid");
+  const pad = 6, baseY = h - pad;
+  const maxV = Math.max(refVal || 0, data.length ? Math.max(...data) : 0, 1) * 1.18;
+
+  // baseline
+  ctx.strokeStyle = grid; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, baseY + 0.5); ctx.lineTo(w, baseY + 0.5); ctx.stroke();
+
+  if (data.length > 1) {
+    const stepX = w / (data.length - 1);
+    const y = (v) => baseY - (v / maxV) * (baseY - pad);
+    // area
+    ctx.beginPath(); ctx.moveTo(0, baseY);
+    data.forEach((v, i) => ctx.lineTo(i * stepX, y(v)));
+    ctx.lineTo((data.length - 1) * stepX, baseY); ctx.closePath();
+    const g = ctx.createLinearGradient(0, pad, 0, baseY);
+    g.addColorStop(0, hexA(color, 0.32)); g.addColorStop(1, hexA(color, 0.02));
+    ctx.fillStyle = g; ctx.fill();
+    // line
+    ctx.beginPath(); data.forEach((v, i) => i ? ctx.lineTo(i * stepX, y(v)) : ctx.moveTo(0, y(v)));
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.stroke();
+  }
+  // 90th-percentile reference line + label. During a run the big number ticks with
+  // the live figure while this marks where p90 (the final headline) currently sits.
+  if (refVal) {
+    const y = baseY - (refVal / maxV) * (baseY - pad);
+    ctx.save();
+    ctx.setLineDash([3, 3]); ctx.strokeStyle = cssVar("--text-faint"); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.font = "600 9.5px " + cssVar("--font-mono");
+    ctx.fillStyle = cssVar("--text-dim"); ctx.textAlign = "right"; ctx.textBaseline = "top";
+    ctx.fillText("p90", w - 3, Math.min(y + 2, baseY - 11));   // clamp so it stays inside the canvas
+    ctx.restore();
+  }
+}
+function hexA(hex, a) {
+  const m = hex.replace("#", "");
+  const r = parseInt(m.substring(0, 2), 16), g = parseInt(m.substring(2, 4), 16), b = parseInt(m.substring(4, 6), 16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+/* ============================ box-plot detail ============================ */
+function renderDetails() {
+  renderGroup("body-dl", "hint-dl", "dl-plot", state.detail.download, "Mbps", true);
+  renderGroup("body-ul", "hint-ul", "ul-plot", state.detail.upload, "Mbps", true);
+  const lat = [
+    { label: "Unloaded", samples: state.rttUnloaded },
+    { label: "During download", samples: state.loaded.download },
+    { label: "During upload", samples: state.loaded.upload },
+  ].filter((r) => r.samples && r.samples.length);
+  renderGroup("body-lat", "hint-lat", "lat-plot", lat, "ms", false);
+}
+
+function renderGroup(bodyId, hintId, plotClass, rows, unit, mbps) {
+  const body = $(bodyId);
+  body.innerHTML = "";
+  const valid = rows.filter((r) => r.samples && r.samples.length);
+  if (!valid.length) { body.innerHTML = '<div class="empty">No data collected.</div>'; return; }
+
+  const axisMax = Math.max(...valid.map((r) => Math.max(...r.samples))) * 1.05 || 1;
+  if (hintId) {
+    const all = valid.flatMap((r) => r.samples);
+    $(hintId).textContent = mbps ? `${fmtMbps(pct(all, 0.9))} Mbps (90th pct)` : `${fmtMs(pct(all, 0.5))} ms median`;
+  }
+
+  valid.forEach((r) => {
+    const s = statsOf(r.samples);
+    const fmt = mbps ? fmtMbps : fmtMs;
+    const row = document.createElement("div");
+    row.className = "brow";
+    const ticks = [0, 0.25, 0.5, 0.75, 1].map((t) =>
+      `<i style="left:${t * 100}%"></i><span style="left:${t * 100}%">${fmt(axisMax * t)}</span>`).join("");
+    const dots = r.samples.map((v) => `<span class="dot" style="left:${clamp(v / axisMax * 100, 0, 100)}%"></span>`).join("");
+    const L = (v) => clamp((v / axisMax) * 100, 0, 100);
+    row.innerHTML = `
+      <div class="brow-top"><span class="bl">${r.label}</span><span class="bn">n=${s.n} · med ${fmt(s.median)} · avg ${fmt(s.avg)} ${unit}</span></div>
+      <div class="plot ${plotClass}">
+        <div class="axis">${ticks}</div>
+        <div class="whisk" style="left:${L(s.min)}%;width:${L(s.max) - L(s.min)}%"><i style="left:0"></i><i style="right:0"></i></div>
+        <div class="box" style="left:${L(s.p25)}%;width:${Math.max(0.5, L(s.p75) - L(s.p25))}%"></div>
+        <div class="mean" style="left:${L(s.avg)}%"></div>
+        <div class="med" style="left:${L(s.median)}%"></div>
+        ${dots}
+      </div>`;
+    body.appendChild(row);
+  });
+}
+
+/* ============================ network quality score ============================ */
+function rate(level) { return level === 2 ? ["Good", "b-good"] : level === 1 ? ["Average", "b-avg"] : ["Bad", "b-bad"]; }
+function band(v, good, avg, lowerBetter) {
+  if (lowerBetter) return v <= good ? 2 : v <= avg ? 1 : 0;
+  return v >= good ? 2 : v >= avg ? 1 : 0;
+}
+function renderNQS() {
+  const dl = state.dlSamples.length ? pct(state.dlSamples, 0.9) : 0;
+  const ul = state.upSamples.length ? pct(state.upSamples, 0.9) : 0;
+  const lat = state.rttUnloaded.length ? pct(state.rttUnloaded, 0.5) : 999;
+  const jit = jitterOf(state.rttUnloaded);
+  const loss = state.loss == null ? 100 : state.loss;
+
+  const streaming = band(dl, 25, 5, false);
+  const gaming = Math.min(band(lat, 50, 100, true), band(jit, 15, 30, true), band(loss, 1, 3, true));
+  const chat = Math.min(band(ul, 3, 1, false), band(lat, 100, 200, true), band(jit, 20, 40, true), band(loss, 2, 5, true));
+
+  apply("nqs-stream", streaming); apply("nqs-game", gaming); apply("nqs-chat", chat);
+  function apply(id, lvl) { const [t, c] = rate(lvl); setNQS(id, t, c); }
+}
+function setNQS(id, text, cls) {
+  const e = $(id); e.textContent = text;
+  e.className = "badge " + cls;
+}
+
+/* ============================ copy report ============================ */
+function buildReport() {
+  const ds = statsOf(state.rttUnloaded);
+  const dl = state.dlSamples.length ? pct(state.dlSamples, 0.9) : null;
+  const ul = state.upSamples.length ? pct(state.upSamples, 0.9) : null;
+  const loadDl = state.loaded.download.length ? pct(state.loaded.download, 0.5) : null;
+  const loadUp = state.loaded.upload.length ? pct(state.loaded.upload, 0.5) : null;
+  const L = [];
+  L.push("===== Blip Speed Test Report =====");
+  L.push("Measured at:  " + (state.finishedAt || new Date()).toString());
+  L.push("Test length:  " + CONFIG.testDurationSec + " s" + (DEMO ? "  (DEMO DATA - not a real measurement)" : ""));
+  L.push("");
+  L.push("Download:     " + fmtMbps(dl) + " Mbps");
+  L.push("Upload:       " + fmtMbps(ul) + " Mbps");
+  L.push("Latency:      " + fmtMs(ds ? ds.median : null) + " ms (median)"
+    + (ds ? "  [min " + fmtMs(ds.min) + " / max " + fmtMs(ds.max) + "]" : ""));
+  L.push("Jitter:       " + fmtMs(jitterOf(state.rttUnloaded)) + " ms");
+  L.push("Latency under load:  down " + fmtMs(loadDl) + " ms / up " + fmtMs(loadUp) + " ms");
+  L.push("Packet loss:  " + fmtLoss(state.loss) + " %  (HTTP-timeout proxy, window "
+    + Math.round(state.pingTimeout) + " ms, " + state.lossSent + " probes)"
+    + (state.lossSent < CONFIG.ping.minSamplesForLoss ? "  [few samples - low confidence]" : ""));
+  L.push("");
+  L.push("Quality:      Streaming " + $("nqs-stream").textContent
+    + " / Gaming " + $("nqs-game").textContent + " / Video chat " + $("nqs-chat").textContent);
+  L.push("");
+  L.push("Download by size:");
+  state.detail.download.forEach((r) => { const s = statsOf(r.samples); L.push("  " + r.label.padEnd(7) + " median " + fmtMbps(s.median) + " Mbps (n=" + s.n + ")"); });
+  L.push("Upload by size:");
+  state.detail.upload.forEach((r) => { const s = statsOf(r.samples); L.push("  " + r.label.padEnd(7) + " median " + fmtMbps(s.median) + " Mbps (n=" + s.n + ")"); });
+  L.push("");
+  L.push("Client IP:    " + (state.ip || "-") + "  (as seen by the server)");
+  L.push("Server:       " + location.host);
+  L.push("Data used:    ~" + (state.totalBytes / 1e6).toFixed(1) + " MB");
+  L.push("Browser:      " + navigator.userAgent);
+  L.push("=============================");
+  return L.join("\n");
+}
+async function copyReport() {
+  const text = buildReport();
+  let ok = false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); ok = true; }
+  } catch (_) {}
+  if (!ok) {                                   // plain-HTTP fallback (no navigator.clipboard without HTTPS)
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      ok = document.execCommand("copy"); document.body.removeChild(ta);
+    } catch (_) {}
+  }
+  toast(ok ? "Copied to clipboard" : "Copy failed - select the report manually");
+}
+
+/* ============================ banners / toast ============================ */
+function showUnreachable() {
+  showBanner("Couldn't reach the test server. This page must be served by the configured nginx. The /upload and /dl/ endpoints have to respond. (Append ?demo=1 to preview with sample data.)");
+  $("phase-label").textContent = "Stopped";
+}
+function showBanner(msg) { $("banner-text").textContent = msg; $("banner").classList.add("show"); }
+function hideBanner() { $("banner").classList.remove("show"); }
+let toastTimer = null;
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 2200);
+}
+
+/* ============================ theme ============================ */
+function safeGet(k) { try { return localStorage.getItem(k); } catch (_) { return null; } }
+function safeSet(k, v) { try { localStorage.setItem(k, v); } catch (_) {} }
+function setTheme(t) {
+  document.documentElement.setAttribute("data-theme", t);
+  safeSet("speedtest-theme", t);
+  $("theme-toggle").innerHTML = t === "dark"
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" stroke-linecap="round"/></svg>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" stroke-linejoin="round"/></svg>';
+  if (state) refreshChartsOnly();
+}
+function refreshChartsOnly() {
+  const dlRef = state.dlSamples.length ? pct(state.dlSamples, 0.9) : recent(state.dlChart);
+  const upRef = state.upSamples.length ? pct(state.upSamples, 0.9) : recent(state.upChart);
+  drawChart($("dl-chart"), state.dlChart, "--dl", dlRef);
+  drawChart($("ul-chart"), state.upChart, "--ul", upRef);
+}
+
+/* ============================ wire-up ============================ */
+function init() {
+  if (DEMO) document.body.classList.add("demo");
+  const stored = safeGet("speedtest-theme");
+  const prefersLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
+  setTheme(stored || (prefersLight ? "light" : "dark"));
+
+  $("theme-toggle").addEventListener("click", () =>
+    setTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark"));
+  $("run-btn").addEventListener("click", runTest);
+  $("copy-btn").addEventListener("click", copyReport);
+
+  setupTooltips();
+
+  window.addEventListener("resize", () => { if (state) refreshChartsOnly(); });
+  getIP().then(() => $("ip-value").textContent = (state && state.ip) || "-").catch(() => {});
+
+  // auto-start once on load; the short delay lets the entrance animation settle
+  setTimeout(() => { if (!running) runTest(); }, 350);
+}
+
+// Tooltips: fixed-positioned, flipped above/below by available room and clamped to the
+// viewport, so they can't clip the screen or get cut off by a card's overflow:hidden.
+// Pointer hover where available, plus click/Enter toggle for touch & keyboard; outside click closes.
+function setupTooltips() {
+  const infos = [...document.querySelectorAll(".info")];
+  const canHover = window.matchMedia && window.matchMedia("(hover: hover)").matches;
+  let active = null, hideTimer = null;
+  // Re-parent each tip to <body> so it positions against the viewport, free of any
+  // card's containing-block/stacking context. That context was throwing the top
+  // cards' tips off-position and letting them stretch the page width.
+  infos.forEach((info) => { info._tip = info.querySelector(".tip"); document.body.appendChild(info._tip); });
+  const tipOf = (i) => i._tip;
+  const btnOf = (i) => i.querySelector(".i-btn");
+
+  function place(info) {
+    const r = btnOf(info).getBoundingClientRect(), tip = tipOf(info);
+    const tw = tip.offsetWidth, th = tip.offsetHeight, gap = 9, m = 8;
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const left = Math.max(m, Math.min(r.left + r.width / 2 - tw / 2, vw - tw - m));
+    const roomBelow = vh - r.bottom - gap >= th, roomAbove = r.top - gap >= th;
+    const below = roomBelow || !roomAbove;
+    let top = below ? r.bottom + gap : r.top - gap - th;
+    top = th <= vh - 2 * m ? Math.max(m, Math.min(top, vh - th - m)) : m;
+    tip.style.left = left + "px"; tip.style.top = top + "px";
+    tip.classList.toggle("below", below); tip.classList.toggle("above", !below);
+    tip.style.setProperty("--arrow", Math.max(12, Math.min(r.left + r.width / 2 - left, tw - 12)) + "px");
+  }
+  function hide(info) {
+    if (!info) return;
+    tipOf(info).classList.remove("show"); btnOf(info).setAttribute("aria-expanded", "false");
+    if (active === info) active = null;
+  }
+  function show(info) {
+    clearTimeout(hideTimer);
+    if (active && active !== info) hide(active);
+    active = info; place(info);
+    tipOf(info).classList.add("show"); btnOf(info).setAttribute("aria-expanded", "true");
+  }
+  const scheduleHide = (info) => { clearTimeout(hideTimer); hideTimer = setTimeout(() => hide(info), 120); };
+
+  infos.forEach((info) => {
+    btnOf(info).addEventListener("click", (e) => {
+      e.preventDefault(); e.stopPropagation();      // don't toggle an enclosing <details>
+      tipOf(info).classList.contains("show") ? hide(info) : show(info);
+    });
+    if (canHover) {
+      info.addEventListener("mouseenter", () => show(info));
+      info.addEventListener("mouseleave", () => scheduleHide(info));
+      tipOf(info).addEventListener("mouseenter", () => clearTimeout(hideTimer));
+      tipOf(info).addEventListener("mouseleave", () => scheduleHide(info));
+    }
+  });
+  document.addEventListener("click", () => hide(active));
+  window.addEventListener("scroll", () => { if (active) place(active); }, true);
+  window.addEventListener("resize", () => { if (active) place(active); });
+}
+state = freshState();
+init();
+</script>
+</body>
+</html>
