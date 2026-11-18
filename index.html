@@ -11,13 +11,15 @@
   - Throughput is AGGREGATE across parallel streams (the real link speed), sampled every
     CONFIG.sampleIntervalMs. Headline = 90th percentile of those samples (the 90th pct, like
     Cloudflare, naturally discounts TCP slow-start instead of us hand-trimming a ramp).
-  - Packet loss here is an HTTP-timeout proxy, NOT true IP-layer loss (TCP repairs real loss
-    before JS sees it). The timeout is ADAPTIVE: max(floor, 3x measured baseline RTT) so a
-    naturally slow/VPN link is not falsely flagged. Only timeouts count as "lost"; hard
-    network errors are surfaced as "server unreachable", never folded into the loss number.
+  - Packet loss here is a late-reply proxy, NOT true IP-layer loss (TCP repairs real loss
+    before JS sees it, but the repair makes that reply late). A ping is "not on time" when its
+    measured RTT exceeds max(2.5x baseline, baseline + 100 ms) or it never replies; the
+    threshold scales with the link so a slow/VPN path is not falsely flagged. Hard network
+    errors are surfaced as "server unreachable", never folded into the figure.
   - Endpoints expected from nginx: GET /dl/<file> (incompressible static files), POST /upload
     (returns 204, body discarded and also answers GET for pings), GET /ip (echoes client IP).
   - Append ?demo=1 to preview the full animated UX with synthetic data and no server.
+  - The test auto-starts on load; append ?autostart=0 to wait for a click on "Start test".
 -->
 <html lang="en" data-theme="dark">
 <head>
@@ -25,6 +27,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
 <title>Blip - Tunnel Speed Test</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M3 15l5-3 3 2 4-7 6 3' fill='none' stroke='%23ff7a1a' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<script>
+  // apply the stored/system theme before first paint (init() re-applies it and draws the toggle icon)
+  try {
+    var t = localStorage.getItem("speedtest-theme");
+    if (t !== "dark" && t !== "light") t = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", t);
+  } catch (_) {}
+</script>
 <style>
   :root{
     --dl:#ff7a1a; --dl-soft:rgba(255,122,26,.16);
@@ -105,6 +116,8 @@
   .statcard .label{display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:var(--text-dim);margin-bottom:7px}
   .statcard .v{font-size:30px;font-weight:700}
   .statcard .v .u{font-size:13px;color:var(--text-dim);font-weight:600;margin-left:3px}
+  .statcard .note{font-size:11px;color:var(--text-faint)}
+  .statcard .note:empty{display:none}
 
   /* info tooltip */
   .info{position:relative;display:inline-flex}
@@ -154,6 +167,7 @@
     border:1px solid var(--border);border-radius:7px;padding:3px 8px;transition:.2s}
   .pchip.active{color:var(--text);border-color:var(--dl);background:var(--dl-soft)}
   .pchip.done{color:var(--good);border-color:transparent}
+  .pchip.fail{color:var(--bad);border-color:transparent}
 
   /* banner */
   .banner{display:none;align-items:flex-start;gap:10px;padding:13px 16px;margin-bottom:16px;border-radius:12px;
@@ -206,7 +220,7 @@
   .box{position:absolute;top:4px;height:12px;border-radius:3px;opacity:.9}
   .med{position:absolute;top:2px;width:2px;height:16px;border-radius:2px}
   .mean{position:absolute;top:3px;width:0;height:14px;border-left:2px dotted var(--text)}
-  .dot{position:absolute;top:13px;width:4px;height:4px;border-radius:50%;transform:translate(-50%,-50%);opacity:.55}
+  .plot .dot{position:absolute;top:13px;width:4px;height:4px;border-radius:50%;transform:translate(-50%,-50%);opacity:.55}
   .dl-plot .box{background:var(--dl)} .dl-plot .med{background:#7a3500} .dl-plot .dot,.dl-plot .whisk,.dl-plot .whisk i{background:var(--dl)}
   .dl-plot .whisk,.dl-plot .whisk i{opacity:.5}
   .ul-plot .box{background:var(--ul)} .ul-plot .med{background:#3b1d80} .ul-plot .dot,.ul-plot .whisk,.ul-plot .whisk i{background:var(--ul)}
@@ -285,9 +299,10 @@
     <div class="card statcard reveal" style="animation-delay:.18s">
       <div class="label">Reliability
         <span class="info"><button class="i-btn" aria-label="What does reliability mean?" aria-expanded="false">i</button>
-          <span class="tip" role="tooltip"><b>Estimated.</b> A browser can't measure true packet loss as it happens below HTTP, and TCP quietly re-sends dropped packets before your code ever sees them. So we send a burst of tiny requests and report the share that get a reply <i>in time</i>; for a live call or game, a reply that lands too late is as good as lost. Treat this as a practical "is my connection holding up?" score, not a network-layer figure. The window scales to your own baseline latency, so a slow link isn't unfairly penalised. Higher is better.</span></span>
+          <span class="tip" role="tooltip"><b>Estimated.</b> A browser can't measure true packet loss as it happens below HTTP, and TCP quietly re-sends dropped packets before your code ever sees them. But a re-send makes that reply arrive noticeably late, so we send a stream of tiny requests and report the share that come back <i>on time</i>; for a live call or game, a reply that lands too late is as good as lost. A reply counts as late when it takes well over your usual round-trip time, or never arrives. Treat this as a practical "is my connection holding up?" score, not a network-layer figure. The cutoff scales to your own baseline latency, so a slow link isn't unfairly penalised. Higher is better.</span></span>
       </div>
       <div class="v num"><span id="loss-value">-</span><span class="u">%</span></div>
+      <div class="note" id="loss-note"></div>
     </div>
   </div>
 
@@ -342,7 +357,7 @@
   </details>
 
   <footer>
-    Measures the network path between your browser and this server. The results reflect that path, not necessarily your ISP's maximum. Packet loss is reported as a Reliability score (an HTTP-timeout proxy), not a true IP-layer figure.
+    Measures the network path between your browser and this server. The results reflect that path, not necessarily your ISP's maximum. Packet loss is reported as a Reliability score (a late-reply proxy), not a true IP-layer figure.
     <br>Built by Pedro · Inspired by Cloudflare Speed Test; not affiliated with Cloudflare. MIT licensed. · <a href="https://github.com/bunnis/blip-pedros-speed-test" target="_blank" rel="noopener noreferrer">Source on GitHub</a>
   </footer>
 </div>
@@ -356,7 +371,8 @@
 const CONFIG = {
   testDurationSec: 30,                          // ⬅ master knob: total wall-clock length of the test, in seconds
   phaseWeights: { latency: 1, download: 2, upload: 2 }, // how the duration is split across phases
-  parallelStreams: 6,                           // concurrent connections per transfer phase
+  parallelStreams: 5,                           // concurrent connections per transfer phase. Keep below the browser's 6-per-host
+                                                // HTTP/1.1 limit: at 6 the loaded-latency probe queues behind the transfers and times out
   sampleIntervalMs: 200,                         // throughput sampling cadence (also chart cadence)
 
   // Accuracy/methodology knobs (aligned with Cloudflare's @cloudflare/speedtest engine).
@@ -368,10 +384,16 @@ const CONFIG = {
   minSampleFracOfInterval: 0.5,   // discard throughput samples from intervals shorter than this × sampleIntervalMs
 
   ping: {
-    floorMs: 300,            // timeout floor; effective timeout = max(floorMs, baselineMult * baseline median)
-    baselineMult: 3,
-    warmupCount: 8,          // pings used to establish the baseline before the adaptive timeout kicks in
-    warmupTimeoutMs: 2000,
+    // A reply is "late" when its measured RTT exceeds max(lateMult × baseline, baseline + lateMarginMs).
+    // That is retransmit-sized: TCP repairs a dropped packet in roughly 2×RTT (tail-loss probe) to
+    // 200-300 ms (retransmission timeout), so a single loss shows up as one late reply. Raise
+    // lateMarginMs if a jittery Wi-Fi link is being flagged; lower it to be stricter.
+    lateMult: 2.5,
+    lateMarginMs: 100,
+    timeoutMs: 2000,         // hard cutoff per probe; a reply slower than this is a stall and counts as not on time
+    warmupCount: 8,          // pings used to establish the baseline the late threshold is derived from
+    intervalMs: 20,          // pause between pings (warm-up and main loop) so a fast LAN isn't flooded with thousands of probes
+    errorBackoffMs: 100,     // extra pause after a hard (non-timeout) error, so a dead server can't spin a hot loop
     minSamplesForLoss: 20,   // below this, loss % is shown with a caveat
   },
 
@@ -397,7 +419,9 @@ const CONFIG = {
   ],
 };
 
-const DEMO = new URLSearchParams(location.search).has("demo");
+const PARAMS = new URLSearchParams(location.search);
+const DEMO = PARAMS.has("demo");
+const AUTOSTART = PARAMS.get("autostart") !== "0";
 
 /* ============================ helpers ============================ */
 const $ = (id) => document.getElementById(id);
@@ -412,10 +436,12 @@ function pct(arr, p) {
   const i = (s.length - 1) * p, lo = Math.floor(i), hi = Math.ceil(i);
   return lo === hi ? s[lo] : s[lo] + (s[hi] - s[lo]) * (i - lo);
 }
+const maxOf = (arr) => arr.reduce((m, v) => v > m ? v : m, -Infinity);
+const minOf = (arr) => arr.reduce((m, v) => v < m ? v : m, Infinity);
 function statsOf(arr) {
   if (!arr.length) return null;
   return {
-    n: arr.length, min: Math.min(...arr), max: Math.max(...arr),
+    n: arr.length, min: minOf(arr), max: maxOf(arr),
     avg: arr.reduce((a, b) => a + b, 0) / arr.length,
     p25: pct(arr, 0.25), median: pct(arr, 0.5), p75: pct(arr, 0.75), p90: pct(arr, 0.9),
   };
@@ -427,7 +453,6 @@ function jitterOf(arr) {
 }
 const fmtMbps = (v) => v == null ? "-" : (v >= 100 ? Math.round(v).toString() : v.toFixed(1));
 const fmtMs = (v) => v == null ? "-" : (v >= 100 ? Math.round(v).toString() : v.toFixed(1));
-const fmtLoss = (v) => v == null ? "-" : (v === 0 ? "0" : v.toFixed(1));
 const fmtReliability = (loss) => loss == null ? "-" : (loss <= 0 ? "100" : (100 - loss).toFixed(1));
 
 /* ============================ state ============================ */
@@ -435,24 +460,28 @@ let state, stopFlag = false, running = false, progTimer = null;
 function freshState() {
   return {
     t0: 0, totalMs: CONFIG.testDurationSec * 1000,
-    ip: null, unreachable: false, baseline: 0, pingTimeout: CONFIG.ping.floorMs,
+    ip: null, unreachable: false, baseline: 0, pingTimeout: CONFIG.ping.timeoutMs,
+    lateMs: 0, late: 0, timeouts: 0,                    // late-reply threshold and the counts behind the Reliability figure
+    failed: { download: false, upload: false },         // transfer phases where every request failed
     dlChart: [], upChart: [], totalBytes: 0,
     dlSamples: [], upSamples: [],                       // aggregate-throughput samples (for headline p90)
     detail: { download: [], upload: [] },               // [{label, samples}]
     rttUnloaded: [], loaded: { download: [], upload: [] },
     loss: null, hardErrors: 0, lossSent: 0,
+    transferErrors: [],                                 // banner messages for phases where every request failed
     activePhase: null, finishedAt: null,
   };
 }
 
 /* ============================ network primitives ============================ */
 function getIP() {
-  if (DEMO) { state.ip = "203.0.113.42"; return Promise.resolve(); }
+  const s = state;   // write into the run that asked, not whichever is current when the reply lands
+  if (DEMO) { s.ip = "203.0.113.42"; return Promise.resolve(); }
   const ctrl = new AbortController();
   const to = setTimeout(() => ctrl.abort(), 4000);
   return fetch(CONFIG.endpoints.ip, { cache: "no-store", signal: ctrl.signal })
-    .then((r) => r.text()).then((t) => { state.ip = (t || "").trim() || "-"; })
-    .catch(() => { state.ip = "-"; })
+    .then((r) => r.text()).then((t) => { s.ip = (t || "").trim() || "-"; })
+    .catch(() => { s.ip = "-"; })
     .finally(() => clearTimeout(to));
 }
 
@@ -491,7 +520,10 @@ function pingOnce(timeoutMs) {
     const url = CONFIG.endpoints.upload + "?pl=" + rnd(); // GET on /upload -> 204, tiny, no body
     xhr.open("GET", url, true);
     xhr.timeout = timeoutMs;
-    xhr.onload = () => res(rttFromTiming(xhr.responseURL || url, now() - t));
+    // a non-2xx reply means this isn't the configured /upload endpoint: count it as a hard error, not a good ping
+    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300)
+      ? res(rttFromTiming(xhr.responseURL || new URL(url, location.href).href, now() - t))
+      : rej({ type: "error" });
     xhr.onerror = () => rej({ type: "error" });
     xhr.ontimeout = () => rej({ type: "timeout" });
     try { xhr.send(); } catch (_) { rej({ type: "error" }); }
@@ -515,7 +547,12 @@ async function dlWorker(file, deadline, ctrl, counter) {
   while (now() < deadline && !ctrl.signal.aborted && !stopFlag) {
     try {
       const res = await fetch(CONFIG.endpoints.dlBase + file + "?cb=" + rnd(), { cache: "no-store", signal: ctrl.signal });
-      if (!res.ok || !res.body) { await sleep(20); continue; }
+      if (!res.ok || !res.body) {
+        counter.fails++;
+        try { if (res.body) res.body.cancel().catch(() => {}); } catch (_) {}
+        await sleep(100); continue;
+      }
+      counter.ok++;
       const reader = res.body.getReader();
       while (true) {
         const { done, value } = await reader.read();
@@ -523,7 +560,7 @@ async function dlWorker(file, deadline, ctrl, counter) {
         counter.bytes += value.length;
         if (now() >= deadline) { try { ctrl.abort(); } catch (_) {} break; }
       }
-    } catch (_) { if (ctrl.signal.aborted) break; await sleep(20); }
+    } catch (_) { if (ctrl.signal.aborted) break; counter.fails++; await sleep(100); }
   }
 }
 
@@ -534,27 +571,36 @@ function uploadOnce(blob, onProgress, signal) {
     xhr.open("POST", CONFIG.endpoints.upload, true);
     let last = 0;
     xhr.upload.onprogress = (e) => { onProgress(e.loaded - last); last = e.loaded; };
-    xhr.onload = () => res();          // 204
-    xhr.onerror = () => rej(new Error("net"));
-    xhr.onabort = () => rej(new Error("abort"));
     const onAbort = () => { try { xhr.abort(); } catch (_) {} };
-    if (signal) signal.addEventListener("abort", onAbort, { once: true });
-    try { xhr.send(blob); } catch (_) { rej(new Error("net")); }
+    const done = (fn, v) => { if (signal) signal.removeEventListener("abort", onAbort); fn(v); };
+    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300) ? done(res) : done(rej, new Error("http " + xhr.status)); // expect 204
+    xhr.onerror = () => done(rej, new Error("net"));
+    xhr.onabort = () => done(rej, new Error("abort"));
+    if (signal) {
+      if (signal.aborted) { rej(new Error("abort")); return; }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    try { xhr.send(blob); } catch (_) { done(rej, new Error("net")); }
   });
 }
 async function upWorker(bytes, deadline, ctrl, counter) {
   const blob = makeBlob(bytes);
   while (now() < deadline && !ctrl.signal.aborted && !stopFlag) {
-    try { await uploadOnce(blob, (d) => { counter.bytes += d; }, ctrl.signal); }
-    catch (_) { if (ctrl.signal.aborted) break; await sleep(15); }
+    let sent = 0;
+    try { await uploadOnce(blob, (d) => { sent += d; counter.bytes += d; }, ctrl.signal); counter.ok++; }
+    catch (_) {
+      if (ctrl.signal.aborted) break;
+      counter.bytes -= sent; counter.fails++;     // bytes pushed at a server that refused them are not throughput
+      await sleep(100);
+    }
   }
 }
 
 /* synthetic throughput for DEMO (Mbps), ramping with file size like a real link */
 function synthMbps(kind, size) {
   const map = kind === "download"
-    ? { 102400: 70, 1048576: 200, 10485760: 380, 26214400: 445 }
-    : { 102400: 35, 1048576: 110, 10485760: 230, 26214400: 270 };
+    ? { 102400: 70, 1048576: 200, 10485760: 380, 26214400: 445, 104857600: 470 }
+    : { 102400: 35, 1048576: 110, 10485760: 230, 26214400: 270, 104857600: 285 };
   const base = map[size.bytes] || 100;
   return Math.max(1, base + (Math.random() + Math.random() + Math.random() - 1.5) * base * 0.22);
 }
@@ -564,32 +610,42 @@ async function phaseLatencyLoss(durationMs) {
   setPhase("latency", "Measuring latency & packet loss");
   const deadline = now() + durationMs;
 
-  // warm-up establishes the baseline that sizes the adaptive timeout
+  // warm-up establishes the baseline that the late-reply threshold is derived from
   const warm = [];
+  let timeouts = 0, hard = 0;
   for (let i = 0; i < CONFIG.ping.warmupCount && now() < deadline && !stopFlag; i++) {
-    try { warm.push(await pingOnce(CONFIG.ping.warmupTimeoutMs)); } catch (_) {}
+    try { warm.push(await pingOnce(state.pingTimeout)); }
+    catch (e) { if (e && e.type === "timeout") timeouts++; else { hard++; await sleep(CONFIG.ping.errorBackoffMs); } }
+    await sleep(CONFIG.ping.intervalMs);
   }
   state.baseline = warm.length ? pct(warm, 0.5) : 0;
-  state.pingTimeout = Math.max(CONFIG.ping.floorMs, Math.round((state.baseline || 50) * CONFIG.ping.baselineMult));
+  state.lateMs = Math.max(state.baseline * CONFIG.ping.lateMult, state.baseline + CONFIG.ping.lateMarginMs);
 
   const rtts = warm.slice();
-  let received = warm.length, timeouts = 0, hard = 0;
+  let received = warm.length;
   while (now() < deadline && !stopFlag) {
     try { const r = await pingOnce(state.pingTimeout); rtts.push(r); received++; }
-    catch (e) { if (e && e.type === "timeout") timeouts++; else hard++; }
+    catch (e) { if (e && e.type === "timeout") timeouts++; else { hard++; await sleep(CONFIG.ping.errorBackoffMs); } }
+    await sleep(CONFIG.ping.intervalMs);
   }
   state.rttUnloaded = rtts;
   state.hardErrors = hard;
-  if (received === 0) { state.unreachable = true; return; }
+  if (received === 0) { if (!stopFlag) state.unreachable = true; return; }
+  // Not on time = replied late (retransmit-sized delay, judged on the measured RTT) or never replied.
+  // Late replies stay in the latency samples: they are real round trips, just slow ones.
+  if (!state.baseline) { state.baseline = pct(rtts, 0.5); state.lateMs = Math.max(state.baseline * CONFIG.ping.lateMult, state.baseline + CONFIG.ping.lateMarginMs); }
+  const late = rtts.filter((r) => r > state.lateMs).length;
   const eff = received + timeouts;
+  state.late = late; state.timeouts = timeouts;
   state.lossSent = eff;
-  state.loss = eff > 0 ? (timeouts / eff) * 100 : 0;
+  state.loss = eff > 0 ? ((late + timeouts) / eff) * 100 : 0;
 }
 
-async function measureSize(kind, size, deadline) {
+async function measureSize(kind, size, deadline, tally) {
   const ctrl = new AbortController();
-  const counter = { bytes: 0 };
+  const counter = { bytes: 0, ok: 0, fails: 0 };
   const samples = [];
+  const bucket = kind === "download" ? state.dlSamples : state.upSamples;   // headline p90, fed live
   const workers = DEMO ? [] : Array.from({ length: CONFIG.parallelStreams }, () =>
     kind === "download" ? dlWorker(size.file, deadline, ctrl, counter) : upWorker(size.bytes, deadline, ctrl, counter));
 
@@ -601,12 +657,12 @@ async function measureSize(kind, size, deadline) {
       const ended = now() >= deadline || stopFlag;
       // [#8] drop degenerate short intervals (timer coalescing / backgrounded-tab catch-up):
       // skipping leaves last/lastBytes untouched so the bytes fold into the next, full-length tick.
-      if (dt < minDt && !ended) return;
+      if (dt < minDt) { if (ended) { clearInterval(id); resolve(); } return; }
       let mbps;
       if (DEMO) { mbps = synthMbps(kind, size); counter.bytes += (mbps * 1e6 * dt) / 8; }
-      else { mbps = dt > 0 ? ((counter.bytes - lastBytes) * 8) / dt / 1e6 : 0; }
+      else { mbps = dt > 0 ? Math.max(0, ((counter.bytes - lastBytes) * 8) / dt / 1e6) : 0; }
       last = t; lastBytes = counter.bytes;
-      samples.push(mbps);
+      samples.push(mbps); bucket.push(mbps);
       pushChart(kind, mbps);
       if (ended) { clearInterval(id); resolve(); }
     }, CONFIG.sampleIntervalMs);
@@ -615,6 +671,7 @@ async function measureSize(kind, size, deadline) {
   try { ctrl.abort(); } catch (_) {}
   await Promise.allSettled(workers);
   state.totalBytes += counter.bytes;
+  if (tally) { tally.bytes += counter.bytes; tally.ok += counter.ok; tally.fails += counter.fails; }
   return samples;
 }
 
@@ -624,7 +681,7 @@ async function phaseTransfer(kind, durationMs) {
 
   const plan = (kind === "download" ? CONFIG.download : CONFIG.upload); // ascending by size
   const phaseDeadline = now() + durationMs;
-  const bucket = (kind === "download" ? state.dlSamples : state.upSamples);
+  const tally = { bytes: 0, ok: 0, fails: 0 };   // per-phase totals across every size slice
 
   // [#2] concurrent loaded-latency probe (bufferbloat): throttled and capped, successes only.
   // Back-to-back probing during a saturated transfer self-contends and skews the figure.
@@ -651,7 +708,6 @@ async function phaseTransfer(kind, durationMs) {
     const existing = d.find((x) => x.label === size.label);
     if (existing) existing.samples = existing.samples.concat(samples);
     else d.push({ label: size.label, samples });
-    bucket.push(...samples);
   };
   const estPerFileMs = (size, fromSamples) => {
     const mbps = fromSamples.length ? pct(fromSamples, 0.9) : 0;     // p90 discounts slow-start
@@ -663,15 +719,16 @@ async function phaseTransfer(kind, durationMs) {
     if (stopFlag || now() >= phaseDeadline) break;
     const size = plan[i], isLast = i === plan.length - 1;
     const sliceMs = isLast ? (phaseDeadline - now()) : Math.min(phaseDeadline - now(), CONFIG.rampSliceMs);
-    const samples = await measureSize(kind, size, now() + sliceMs);
+    const samples = await measureSize(kind, size, now() + sliceMs, tally);
     record(size, samples);
+    if (!DEMO && tally.ok === 0 && tally.fails > 0) break;   // endpoint is refusing everything: don't burn the window retrying
     if (isLast) break;
 
     const next = plan[i + 1];
     const stopClimbing = estPerFileMs(size, samples) >= CONFIG.bandwidthFinishRequestDuration
       || estPerFileMs(next, samples) >= (phaseDeadline - now());
     if (stopClimbing) {
-      if (phaseDeadline - now() > 0 && !stopFlag) record(size, await measureSize(kind, size, phaseDeadline));
+      if (phaseDeadline - now() > 0 && !stopFlag) record(size, await measureSize(kind, size, phaseDeadline, tally));
       break;
     }
   }
@@ -679,6 +736,19 @@ async function phaseTransfer(kind, durationMs) {
   loadedStop.v = true; await loadedLoop;
   if (DEMO) state.demoLoad = 1;
   state.loaded[kind] = loadedRtts;
+
+  // every request failed: say so instead of silently reporting 0.0 Mbps (the run still continues).
+  // Drop the all-zero samples so the headline, chart, panels and quality badges read "not measured".
+  if (!DEMO && !stopFlag && tally.fails > 0 && (tally.bytes <= 0 || tally.ok === 0)) {
+    state.failed[kind] = true;
+    (kind === "download" ? state.dlSamples : state.upSamples).length = 0;
+    (kind === "download" ? state.dlChart : state.upChart).length = 0;
+    state.detail[kind] = [];
+    state.transferErrors.push(kind === "download"
+      ? "Download test failed: /dl/ files did not respond (HTTP errors). Run make-files.sh and check the nginx /dl/ location."
+      : "Upload test failed: /upload did not accept POSTs (HTTP errors). Check the nginx /upload location (204 on POST, client_max_body_size).");
+    showBanner(state.transferErrors.join(" "));
+  }
 }
 
 /* ============================ orchestration ============================ */
@@ -693,19 +763,21 @@ async function runTest() {
   try { performance.clearResourceTimings(); performance.setResourceTimingBufferSize(20000); } catch (_) {}
 
   try {
-    await getIP();
-    renderIP();
+    const s = state;
+    getIP().then(() => { if (s === state) renderIP(); });
 
     const total = state.totalMs, w = CONFIG.phaseWeights, sum = w.latency + w.download + w.upload;
     state.t0 = now();
     startProgressTimer();
 
     await phaseLatencyLoss((total * w.latency) / sum);
+    if (stopFlag) { showStopped(); return; }
     if (state.unreachable) { showUnreachable(); return; }
 
     await phaseTransfer("download", (total * w.download) / sum);
-    if (stopFlag) return;
+    if (stopFlag) { showStopped(); return; }
     await phaseTransfer("upload", (total * w.upload) / sum);
+    if (stopFlag) { showStopped(); return; }
 
     finalize();
   } catch (e) {
@@ -719,12 +791,25 @@ function stopTest() { stopFlag = true; }
 
 function fmtClock(d) { return [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, "0")).join(":"); }
 
+function showStopped() {
+  state.activePhase = null;
+  $("phase-label").textContent = "Stopped";
+  document.querySelectorAll(".pchip").forEach((c) => c.classList.remove("active"));
+  refreshReadouts(true, true);   // p90 headlines for what completed, but no quality rating on a partial run
+  renderDetails();
+  $("copy-btn").disabled = !(state.dlSamples.length || state.upSamples.length || state.rttUnloaded.length);
+}
+
 function finalize() {
+  state.activePhase = null;
   state.finishedAt = new Date();
   refreshReadouts(true);
   renderDetails();
-  $("phase-label").textContent = "Done";
-  markChips("done");
+  const anyFailed = state.failed.download || state.failed.upload;
+  $("phase-label").textContent = anyFailed ? "Finished with errors" : "Done";
+  document.querySelectorAll(".pchip").forEach((c) => {
+    c.classList.remove("active"); c.classList.add(state.failed[c.dataset.phase] ? "fail" : "done");
+  });
   setProgress(1);
   $("measured-at").innerHTML = 'measured at <span class="num">' + fmtClock(state.finishedAt) + "</span>";
   $("copy-btn").disabled = false;
@@ -737,9 +822,6 @@ function setPhase(phase, label) {
   document.querySelectorAll(".pchip").forEach((c) => {
     c.classList.toggle("active", c.dataset.phase === phase);
   });
-}
-function markChips(cls) {
-  document.querySelectorAll(".pchip").forEach((c) => { c.classList.remove("active"); c.classList.add(cls); });
 }
 function setProgress(frac) {
   const p = clamp(frac, 0, 1);
@@ -766,26 +848,41 @@ function setRunning(on) {
 
 function resetReadouts() {
   $("measured-at").textContent = "";
+  $("loss-note").textContent = "";
   ["dl-value", "ul-value", "lat-value", "jit-value", "loss-value"].forEach((id) => $(id).textContent = "-");
   setNQS("nqs-stream", "-", "b-idle"); setNQS("nqs-game", "-", "b-idle"); setNQS("nqs-chat", "-", "b-idle");
   drawChart($("dl-chart"), [], "--dl", 0);
   drawChart($("ul-chart"), [], "--ul", 0);
+  document.querySelectorAll(".pchip").forEach((c) => c.classList.remove("done", "active", "fail"));
+  $("copy-btn").disabled = true;
+  setProgress(0);
+  const speedEmpty = '<div class="empty">Run a test to see the distribution of speeds by file size.</div>';
+  $("body-dl").innerHTML = speedEmpty; $("body-ul").innerHTML = speedEmpty;
+  $("body-lat").innerHTML = '<div class="empty">Run a test to see latency when idle and under load.</div>';
+  ["hint-dl", "hint-ul", "hint-lat"].forEach((id) => $(id).textContent = "");
 }
 
 // Recompute live (final=true uses 90th-percentile headline; otherwise a smoothed running figure).
-function refreshReadouts(final) {
+function refreshReadouts(final, skipNQS) {
   // download / upload headline
-  const dlHead = final ? (state.dlSamples.length ? pct(state.dlSamples, 0.9) : null) : recent(state.dlChart);
-  const upHead = final ? (state.upSamples.length ? pct(state.upSamples, 0.9) : null) : recent(state.upChart);
-  if (dlHead != null) $("dl-value").textContent = fmtMbps(dlHead);
-  if (upHead != null) $("ul-value").textContent = fmtMbps(upHead);
+  // live figure only while that direction is being measured; otherwise its p90
+  const head = (phase, samples, chart) => (!final && state.activePhase === phase)
+    ? recent(chart) : (samples.length ? pct(samples, 0.9) : null);
+  const dlHead = head("download", state.dlSamples, state.dlChart);
+  const upHead = head("upload", state.upSamples, state.upChart);
+  $("dl-value").textContent = fmtMbps(dlHead);   // "-" until measured, and again if the phase failed
+  $("ul-value").textContent = fmtMbps(upHead);
 
   // latency / jitter / loss from unloaded RTTs
   if (state.rttUnloaded.length) {
     $("lat-value").textContent = fmtMs(pct(state.rttUnloaded, 0.5));
     $("jit-value").textContent = fmtMs(jitterOf(state.rttUnloaded));
   }
-  if (state.loss != null) $("loss-value").textContent = fmtReliability(state.loss);
+  if (state.loss != null) {
+    const low = state.lossSent < CONFIG.ping.minSamplesForLoss;   // too few probes to trust the figure
+    $("loss-value").textContent = (low ? "~" : "") + fmtReliability(state.loss);
+    $("loss-note").textContent = low ? "low confidence · " + state.lossSent + " probes" : "";
+  }
 
   // charts
   const dlRef = state.dlSamples.length ? pct(state.dlSamples, 0.9) : recent(state.dlChart);
@@ -793,7 +890,7 @@ function refreshReadouts(final) {
   drawChart($("dl-chart"), state.dlChart, "--dl", dlRef);
   drawChart($("ul-chart"), state.upChart, "--ul", upRef);
 
-  if (final) renderNQS();
+  if (final && !skipNQS) renderNQS();
 }
 function recent(arr) {
   if (!arr.length) return null;
@@ -816,7 +913,8 @@ function cssVar(name) { return getComputedStyle(document.documentElement).getPro
 function drawChart(canvas, data, colorVar, refVal) {
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth || 300, h = canvas.clientHeight || 74;
-  if (canvas.width !== w * dpr || canvas.height !== h * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
+  const cw = Math.round(w * dpr), ch = Math.round(h * dpr);
+  if (canvas.width !== cw || canvas.height !== ch) { canvas.width = cw; canvas.height = ch; }
   const ctx = canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
@@ -824,7 +922,7 @@ function drawChart(canvas, data, colorVar, refVal) {
   const color = cssVar(colorVar);
   const grid = cssVar("--grid");
   const pad = 6, baseY = h - pad;
-  const maxV = Math.max(refVal || 0, data.length ? Math.max(...data) : 0, 1) * 1.18;
+  const maxV = Math.max(refVal || 0, data.length ? maxOf(data) : 0, 1) * 1.18;
 
   // baseline
   ctx.strokeStyle = grid; ctx.lineWidth = 1;
@@ -882,7 +980,7 @@ function renderGroup(bodyId, hintId, plotClass, rows, unit, mbps) {
   const valid = rows.filter((r) => r.samples && r.samples.length);
   if (!valid.length) { body.innerHTML = '<div class="empty">No data collected.</div>'; return; }
 
-  const axisMax = Math.max(...valid.map((r) => Math.max(...r.samples))) * 1.05 || 1;
+  const axisMax = maxOf(valid.map((r) => maxOf(r.samples))) * 1.05 || 1;
   if (hintId) {
     const all = valid.flatMap((r) => r.samples);
     $(hintId).textContent = mbps ? `${fmtMbps(pct(all, 0.9))} Mbps (90th pct)` : `${fmtMs(pct(all, 0.5))} ms median`;
@@ -895,7 +993,9 @@ function renderGroup(bodyId, hintId, plotClass, rows, unit, mbps) {
     row.className = "brow";
     const ticks = [0, 0.25, 0.5, 0.75, 1].map((t) =>
       `<i style="left:${t * 100}%"></i><span style="left:${t * 100}%">${fmt(axisMax * t)}</span>`).join("");
-    const dots = r.samples.map((v) => `<span class="dot" style="left:${clamp(v / axisMax * 100, 0, 100)}%"></span>`).join("");
+    const step = Math.max(1, r.samples.length / 300), pts = [];   // cap DOM dots; stats use all samples
+    for (let i = 0; i < r.samples.length && pts.length < 300; i += step) pts.push(r.samples[Math.floor(i)]);
+    const dots = pts.map((v) => `<span class="dot" style="left:${clamp(v / axisMax * 100, 0, 100)}%"></span>`).join("");
     const L = (v) => clamp((v / axisMax) * 100, 0, 100);
     row.innerHTML = `
       <div class="brow-top"><span class="bl">${r.label}</span><span class="bn">n=${s.n} · med ${fmt(s.median)} · avg ${fmt(s.avg)} ${unit}</span></div>
@@ -924,12 +1024,14 @@ function renderNQS() {
   const jit = jitterOf(state.rttUnloaded);
   const loss = state.loss == null ? 100 : state.loss;
 
-  const streaming = band(dl, 25, 5, false);
+  // a direction that was never measured (its phase failed) leaves the badges that depend on it unrated
+  const streaming = state.dlSamples.length ? band(dl, 25, 5, false) : null;
   const gaming = Math.min(band(lat, 50, 100, true), band(jit, 15, 30, true), band(loss, 1, 3, true));
-  const chat = Math.min(band(ul, 3, 1, false), band(lat, 100, 200, true), band(jit, 20, 40, true), band(loss, 2, 5, true));
+  const chat = state.upSamples.length
+    ? Math.min(band(ul, 3, 1, false), band(lat, 100, 200, true), band(jit, 20, 40, true), band(loss, 2, 5, true)) : null;
 
   apply("nqs-stream", streaming); apply("nqs-game", gaming); apply("nqs-chat", chat);
-  function apply(id, lvl) { const [t, c] = rate(lvl); setNQS(id, t, c); }
+  function apply(id, lvl) { if (lvl == null) return setNQS(id, "-", "b-idle"); const [t, c] = rate(lvl); setNQS(id, t, c); }
 }
 function setNQS(id, text, cls) {
   const e = $(id); e.textContent = text;
@@ -948,15 +1050,16 @@ function buildReport() {
   L.push("Measured at:  " + (state.finishedAt || new Date()).toString());
   L.push("Test length:  " + CONFIG.testDurationSec + " s" + (DEMO ? "  (DEMO DATA - not a real measurement)" : ""));
   L.push("");
-  L.push("Download:     " + fmtMbps(dl) + " Mbps");
-  L.push("Upload:       " + fmtMbps(ul) + " Mbps");
+  L.push("Download:     " + (state.failed.download ? "failed (HTTP errors from /dl/)" : fmtMbps(dl) + " Mbps"));
+  L.push("Upload:       " + (state.failed.upload ? "failed (HTTP errors from /upload)" : fmtMbps(ul) + " Mbps"));
   L.push("Latency:      " + fmtMs(ds ? ds.median : null) + " ms (median)"
     + (ds ? "  [min " + fmtMs(ds.min) + " / max " + fmtMs(ds.max) + "]" : ""));
   L.push("Jitter:       " + fmtMs(jitterOf(state.rttUnloaded)) + " ms");
   L.push("Latency under load:  down " + fmtMs(loadDl) + " ms / up " + fmtMs(loadUp) + " ms");
-  L.push("Reliability:  " + fmtReliability(state.loss) + " %  (timely-reply rate; HTTP-timeout proxy, window "
-    + Math.round(state.pingTimeout) + " ms, " + state.lossSent + " probes)"
+  L.push("Reliability:  " + fmtReliability(state.loss) + " %  (on-time reply rate, a packet-loss proxy; late = over "
+    + Math.round(state.lateMs) + " ms; " + state.late + " late + " + state.timeouts + " timed out of " + state.lossSent + " probes)"
     + (state.lossSent < CONFIG.ping.minSamplesForLoss ? "  [few samples - low confidence]" : ""));
+  if (state.hardErrors > 0) L.push("Ping errors:  " + state.hardErrors + " hard network errors during the latency phase");
   L.push("");
   L.push("Quality:      Streaming " + $("nqs-stream").textContent
     + " / Gaming " + $("nqs-game").textContent + " / Video chat " + $("nqs-chat").textContent);
@@ -994,6 +1097,8 @@ async function copyReport() {
 function showUnreachable() {
   showBanner("Couldn't reach the test server. This page must be served by the configured nginx. The /upload and /dl/ endpoints have to respond. (Append ?demo=1 to preview with sample data.)");
   $("phase-label").textContent = "Stopped";
+  state.activePhase = null;
+  document.querySelectorAll(".pchip").forEach((c) => c.classList.remove("active"));
 }
 function showBanner(msg) { $("banner-text").textContent = msg; $("banner").classList.add("show"); }
 function hideBanner() { $("banner").classList.remove("show"); }
@@ -1036,10 +1141,10 @@ function init() {
   setupTooltips();
 
   window.addEventListener("resize", () => { if (state) refreshChartsOnly(); });
-  getIP().then(() => $("ip-value").textContent = (state && state.ip) || "-").catch(() => {});
 
   // auto-start once on load; the short delay lets the entrance animation settle
-  setTimeout(() => { if (!running) runTest(); }, 350);
+  // (skipped with ?autostart=0; the button then stays on "Start test")
+  if (AUTOSTART) setTimeout(() => { if (!running) runTest(); }, 350);
 }
 
 // Tooltips: fixed-positioned, flipped above/below by available room and clamped to the
@@ -1052,7 +1157,11 @@ function setupTooltips() {
   // Re-parent each tip to <body> so it positions against the viewport, free of any
   // card's containing-block/stacking context. That context was throwing the top
   // cards' tips off-position and letting them stretch the page width.
-  infos.forEach((info) => { info._tip = info.querySelector(".tip"); document.body.appendChild(info._tip); });
+  infos.forEach((info, n) => {
+    info._tip = info.querySelector(".tip"); document.body.appendChild(info._tip);
+    info._tip.id = "tip-" + (n + 1);
+    info.querySelector(".i-btn").setAttribute("aria-describedby", info._tip.id);
+  });
   const tipOf = (i) => i._tip;
   const btnOf = (i) => i.querySelector(".i-btn");
 
@@ -1087,6 +1196,8 @@ function setupTooltips() {
       e.preventDefault(); e.stopPropagation();      // don't toggle an enclosing <details>
       tipOf(info).classList.contains("show") ? hide(info) : show(info);
     });
+    // keyboard: leaving the button closes its tip (unless the pointer is resting on the tip itself)
+    btnOf(info).addEventListener("blur", () => { if (!tipOf(info).matches(":hover")) hide(info); });
     if (canHover) {
       info.addEventListener("mouseenter", () => show(info));
       info.addEventListener("mouseleave", () => scheduleHide(info));
@@ -1095,6 +1206,7 @@ function setupTooltips() {
     }
   });
   document.addEventListener("click", () => hide(active));
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && active) hide(active); });
   window.addEventListener("scroll", () => { if (active) place(active); }, true);
   window.addEventListener("resize", () => { if (active) place(active); });
 }

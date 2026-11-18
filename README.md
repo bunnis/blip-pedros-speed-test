@@ -4,6 +4,7 @@ A single self-contained `index.html` that measures the network path between a
 browser and **this** nginx server: download, upload, latency, jitter, an
 estimated packet-loss figure, and a simple quality score. No backend, no
 external libraries, no build step. Served by bare nginx.
+
 ---
 
 ### Quick start with Docker
@@ -15,7 +16,7 @@ mounted in. No build step.
 # 1. Generate the incompressible download files once (host side).
 ./make-files.sh ./dl
 
-# 2. Run it: serves on http:///, restarts on boot, dl/ persists on the host.
+# 2. Run it: serves on http://localhost/, restarts on boot, dl/ persists on the host.
 docker run -d --name blip --restart unless-stopped -p 80:80 \
   -v "$PWD/nginx.conf:/etc/nginx/nginx.conf:ro" \
   -v "$PWD/index.html:/var/www/blipspeedtest/index.html:ro" \
@@ -44,6 +45,14 @@ docker run -d --name blip --restart unless-stopped -p 80:80 \
 Preview the UI without deploying anything by opening `index.html?demo=1` - it
 synthesises plausible numbers client-side and badges itself **DEMO DATA**.
 
+The test auto-starts on every load. Append `?autostart=0` to wait for a click on
+**Start test** instead (useful on metered links, since a run can move ~1 GB).
+
+If a transfer endpoint refuses every request (missing `dl/` files, `/upload` not
+configured), that phase ends early, its speed shows `-` rather than `0.0`, the
+quality badges that depend on it stay unrated, and the run ends on "Finished with
+errors" with a banner naming the endpoint.
+
 ## The one knob
 
 `CONFIG.testDurationSec` near the top of the script (default `30`) is the only
@@ -64,7 +73,7 @@ The parts below are choices you can't infer by reading the code, or that look
 wrong until you know why.
 
 **Parallel streams, aggregate throughput.** Download and upload each run
-`CONFIG.parallelStreams` (6) concurrent connections, and the reported speed is
+`CONFIG.parallelStreams` (5) concurrent connections, and the reported speed is
 the *aggregate* across them. A single TCP flow under-reports a fast or
 high-latency link because one connection's congestion window can't fill the pipe;
 multiple flows can. This is the standard approach for saturation tests.
@@ -77,11 +86,11 @@ full distribution (min / p25 / median / p75 / max) per file size if you want to
 see the spread.
 
 **Adaptive size ramp.** Within each direction the test starts at the smallest file
-and climbs: it spends a short slice at a size, estimates how long one file of the
-*next* size would take at the speed it just measured, and steps up only if that's
-comfortably under `CONFIG.bandwidthFinishRequestDuration` (1 s). Once a size's files
-would take longer than that (or the next size wouldn't fit in the time left) it
-stops climbing and spends the rest of the window at that largest feasible size. A
+and climbs: it spends a short slice at a size, then estimates from the speed it just
+measured how long one file takes per stream. It steps up as long as a file of the
+*current* size still finishes in under `CONFIG.bandwidthFinishRequestDuration` (1 s)
+and a file of the *next* size would fit in the time left in the phase. Otherwise it
+stops climbing and spends the rest of the window at the size it has reached. A
 fast link walks up to the 100 MB file and dwells there; a slow tunnel settles on,
 say, 10 MB instead of grinding on a 100 MB transfer it can't finish. The full phase
 window is always used either way, and the detail panels only show the sizes actually
@@ -99,18 +108,25 @@ sending. The exact moment the 204 comes back doesn't affect the measurement.
 nginx speaks HTTP over TCP, and TCP silently retransmits lost segments before any
 JavaScript sees them. Real IP-layer loss is invisible to a browser talking to an
 HTTP server; measuring it would need a UDP/WebRTC path (a TURN server), which this
-deliberately doesn't have. So the "packet loss" figure is a **proxy**: sequential
-pings, counting replies that don't arrive within an adaptive window of
-`max(300 ms, 3 × baseline-median RTT)`. The window scales to the link so a slow or
-high-latency tunnel doesn't get flagged with false positives. Only **timeouts**
-count toward the percentage; **hard errors** (connection refused/reset -> server
-actually unreachable) are surfaced separately as "couldn't reach server" and never
-folded into the loss number. Below `CONFIG.ping.minSamplesForLoss` (20) samples
-the figure is shown with a low-confidence caveat. The card surfaces this inverted as
-a **Reliability** percentage (`100 − the timeout rate`, so higher is better); the
-copied report uses the same figure. On a VPN this is still useful:
-a misconfigured tunnel MTU or fragmentation tends to show up here as elevated
-timeouts and jitter.
+deliberately doesn't have. So the "packet loss" figure is a **proxy** built on what
+a retransmit does leave visible: it makes that reply late. TCP repairs a dropped
+packet in roughly 2 × RTT (tail-loss probe) to 200-300 ms (retransmission timeout),
+so the page sends sequential pings and counts a reply as **not on time** when its
+measured RTT exceeds `max(2.5 × baseline, baseline + 100 ms)`, or when it never
+arrives within `ping.timeoutMs` (2 s). The threshold scales to the link so a slow or
+high-latency tunnel doesn't get flagged with false positives. An earlier version
+only counted replies slower than `max(300 ms, 3 × baseline)`; a single retransmit on
+a low-latency link lands under that, so the figure read 100% almost regardless of
+real loss. The trade-off of the tighter threshold is that a large jitter spike on
+Wi-Fi counts as late even when nothing was dropped; raise `ping.lateMarginMs` if
+that bothers you. Late replies still count as latency samples. **Hard errors**
+(connection refused/reset, or a non-2xx reply -> server actually unreachable) are
+surfaced separately as "couldn't reach server" and never folded into the figure.
+Below `CONFIG.ping.minSamplesForLoss` (20) samples the figure is shown with a
+low-confidence caveat. The card surfaces this as a **Reliability** percentage (the
+on-time reply rate, so higher is better); the copied report uses the same figure and
+lists the late and timed-out counts. On a VPN this is useful: a misconfigured tunnel
+MTU or fragmentation tends to show up here as late replies and jitter.
 
 **Latency, loaded and unloaded.** Unloaded latency/jitter come from the ping phase
 (the successful RTTs double as the latency samples). During the download and
@@ -122,7 +138,7 @@ so XHR scheduling and event-loop jitter stay out of the number; the loaded probe
 throttled (~400 ms apart) and capped at the most recent 20 samples so it doesn't
 congest the very transfer it's measuring.
 
-**HTTP/1.1 vs HTTP/2.** The vhost ships on HTTP/1.1 on purpose. Under HTTP/2 the 6
+**HTTP/1.1 vs HTTP/2.** The vhost ships on HTTP/1.1 on purpose. Under HTTP/2 the 5
 "parallel" requests multiplex onto a single connection and a single congestion
 window, which under-fills a fat tunnel. If you put TLS + HTTP/2 in front, either
 keep this vhost on 1.1 or raise `parallelStreams` and expect different ramp
@@ -149,10 +165,10 @@ jump as they update. Orange = download, violet = upload throughout.
 
 ## What it deliberately does NOT do
 
-- **Not true packet loss.** See above, it's an HTTP-timeout proxy. Don't quote it
+- **Not true packet loss.** See above, it's a late-reply proxy. Don't quote it
   as a hard loss percentage.
 - **Single endpoint.** No geo-distributed servers; it tests one path only.
-- **Uses real bandwidth, and a lot of it.** The largest probe is 100 MB over 6
+- **Uses real bandwidth, and a lot of it.** The largest probe is 100 MB over 5
   parallel streams, so a fast link can move several hundred MB up to ~1 GB+ per run,
   and the test auto-starts on every page load. That's fine on your own infra (the
   point is to saturate the tunnel). A slow link no longer grinds on the 100 MB file,
@@ -172,8 +188,15 @@ All in the `CONFIG` object at the top of the script:
 - `phaseWeights` - how that budget splits across `latency` / `download` / `upload`.
 - `parallelStreams` - concurrent connections per transfer phase.
 - `sampleIntervalMs` - throughput sampling + chart cadence.
-- `ping.floorMs`, `ping.baselineMult` - the adaptive loss/latency timeout
-  (`max(floorMs, baselineMult × baseline median)`).
+- `parallelStreams` defaults to 5, not 6, on purpose: browsers allow 6 HTTP/1.1
+  connections per host, and at 6 the under-load latency probe queues behind the
+  transfers and times out.
+- `ping.lateMult`, `ping.lateMarginMs` - the late-reply threshold behind Reliability
+  (`max(lateMult × baseline, baseline + lateMarginMs)`).
+- `ping.timeoutMs` - hard cutoff per probe; slower than this counts as not on time.
+- `ping.intervalMs` - pause between pings, so a fast LAN isn't flooded with probes.
+- `ping.errorBackoffMs` - extra pause after a hard error, so a dead server can't
+  spin a hot loop.
 - `ping.minSamplesForLoss` - below this, the reliability figure is caveated.
 - `loadedLatencyThrottleMs` / `loadedLatencyMaxPoints` - spacing and cap for the
   under-load latency probes.
